@@ -5,13 +5,14 @@ mod parser;
 mod tests;
 
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{self, Read},
+    path::{Path, PathBuf},
     process,
 };
 
-use emit::{bash::BashEmitter, fish::FishEmitter, pwsh::PwshEmitter, Emitter};
+use ast::Node;
+use emit::{Emitter, bash::BashEmitter, fish::FishEmitter, pwsh::PwshEmitter};
 use parser::Parser;
 
 const USAGE: &str = "\
@@ -47,7 +48,7 @@ DSL REFERENCE
   # comment (inline or full-line)
 ";
 
-fn read(path: Option<&String>) -> Result<String, String> {
+fn read(path: Option<&str>) -> Result<String, String> {
     match path {
         Some(p) => fs::read_to_string(p).map_err(|e| format!("{}: {}", p, e)),
         None => {
@@ -60,41 +61,113 @@ fn read(path: Option<&String>) -> Result<String, String> {
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("{}", USAGE);
-        process::exit(1);
+/// Resolve a path token from a shed source file.
+///
+/// Rules (applied in order):
+/// 1. `~` prefix  → replace with `$HOME` (Unix) / `$USERPROFILE` (Windows).
+///    If neither var is set the `~` is left as-is rather than silently
+///    producing a wrong path.
+/// 2. Relative path → join onto `base` (the directory of the shed file).
+///    When reading from stdin `base` is `None`; relative paths are kept as-is
+///    because there is no meaningful anchor.
+/// 3. Absolute path → returned unchanged.
+///
+/// No I/O is performed; the path need not exist.
+fn resolve_path(dir: &str, base: Option<&Path>) -> String {
+    // Step 1 — home-dir expansion.
+    let expanded: PathBuf = if let Some(rest) = dir.strip_prefix('~') {
+        let home = env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .unwrap_or_default();
+        if home.is_empty() {
+            // Cannot expand; return as-is.
+            return dir.to_owned();
+        }
+        // rest starts with '/' on Unix or is empty for bare '~'.
+        PathBuf::from(home).join(rest.trim_start_matches('/'))
+    } else {
+        PathBuf::from(dir)
+    };
+
+    // Step 2 — resolve relative paths against the shed file's directory.
+    if expanded.is_relative() {
+        base.map(|b| b.join(&expanded))
+            .unwrap_or(expanded)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        expanded.to_string_lossy().into_owned()
     }
+}
 
-    let shell   = &args[1];
-    let file    = args.get(2);
+/// Walk the AST and resolve every `Node::Path` directory in place.
+/// All other node types are passed through unchanged.
+fn resolve_paths(nodes: Vec<Node>, base: Option<&Path>) -> Vec<Node> {
+    nodes
+        .into_iter()
+        .map(|n| match n {
+            Node::Path { dir, prepend } => Node::Path {
+                dir: resolve_path(&dir, base),
+                prepend,
+            },
+            Node::If(mut inode) => {
+                inode.body = resolve_paths(inode.body, base);
+                inode.elifs = inode
+                    .elifs
+                    .into_iter()
+                    .map(|(c, b)| (c, resolve_paths(b, base)))
+                    .collect();
+                inode.else_ = resolve_paths(inode.else_, base);
+                Node::If(inode)
+            }
+            other => other,
+        })
+        .collect()
+}
 
-    let src = read(file).unwrap_or_else(|e| {
-        eprintln!("shed: {}", e);
-        process::exit(1);
-    });
+fn base_dir(file: Option<&str>) -> Option<PathBuf> {
+    let parent = Path::new(file?).parent()?;
+    Some(
+        env::current_dir()
+            .map(|cwd| cwd.join(parent))
+            .unwrap_or_else(|_| parent.to_path_buf()),
+    )
+}
 
-    let ast = Parser::new(&src).parse().unwrap_or_else(|e| {
-        eprintln!("shed: {}", e);
-        process::exit(1);
-    });
+fn emit(shell: &str, ast: &[Node]) -> Result<String, String> {
+    match shell {
+        "bash" => Ok(BashEmitter::new("bash").render(ast)),
+        "zsh" => Ok(BashEmitter::new("zsh").render(ast)),
+        "fish" => Ok(FishEmitter.render(ast)),
+        "pwsh" => Ok(PwshEmitter.render(ast)),
+        other => Err(format!(
+            "unknown shell {:?} — choose: bash, zsh, fish, pwsh",
+            other
+        )),
+    }
+}
+
+fn run(args: &[String]) -> Result<(), String> {
+    let shell = args.get(1).map(String::as_str).ok_or(USAGE)?;
+    let file = args.get(2).map(String::as_str);
+    let base = base_dir(file);
+
+    let ast = read(file)
+        .and_then(|src| Parser::new(&src).parse().map_err(|e| e.to_string()))
+        .map(|nodes| resolve_paths(nodes, base.as_deref()))?;
 
     if shell == "check" {
         println!("ok ({} top-level nodes)", ast.len());
-        return;
+        return Ok(());
     }
 
-    let out: String = match shell.as_str() {
-        "bash" => BashEmitter::new("bash").render(&ast),
-        "zsh"  => BashEmitter::new("zsh").render(&ast),
-        "fish" => FishEmitter.render(&ast),
-        "pwsh" => PwshEmitter.render(&ast),
-        other  => {
-            eprintln!("shed: unknown shell {:?} — choose: bash, zsh, fish, pwsh", other);
-            process::exit(1);
-        }
-    };
+    emit(shell, &ast).map(|out| println!("{}", out))
+}
 
-    println!("{}", out);
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if let Err(e) = run(&args) {
+        eprintln!("shed: {}", e);
+        process::exit(1);
+    }
 }

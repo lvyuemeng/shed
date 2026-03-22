@@ -1,10 +1,12 @@
-use crate::ast::{Cond, IfNode, Node};
 use super::Emitter;
+use crate::ast::{Cond, IfNode, Node};
 
 pub struct FishEmitter;
 
 impl Emitter for FishEmitter {
-    fn name(&self) -> &str { "fish" }
+    fn name(&self) -> &str {
+        "fish"
+    }
 
     fn emit_nodes(&self, nodes: &[Node], d: usize) -> Vec<String> {
         nodes.iter().flat_map(|n| self.node(n, d)).collect()
@@ -14,22 +16,25 @@ impl Emitter for FishEmitter {
 impl FishEmitter {
     fn node(&self, n: &Node, d: usize) -> Vec<String> {
         match n {
-            Node::Set { key, val } =>
-                vec![self.indent(format!("set -gx {} \"{}\"", key, val), d)],
+            Node::Set { key, val } => vec![self.indent(format!("set -gx {} \"{}\"", key, val), d)],
 
             // fish_add_path deduplicates automatically — no double-PATH-entry problem
-            Node::Path { dir, prepend: true } =>
-                vec![self.indent(format!("fish_add_path -gP \"{}\"", dir), d)],
+            Node::Path { dir, prepend: true } => {
+                vec![self.indent(format!("fish_add_path -gP \"{}\"", dir), d)]
+            }
 
-            Node::Path { dir, prepend: false } =>
-                vec![self.indent(format!("fish_add_path -gaP \"{}\"", dir), d)],
+            Node::Path {
+                dir,
+                prepend: false,
+            } => vec![self.indent(format!("fish_add_path -gaP \"{}\"", dir), d)],
 
             Node::Inject { cmd, args } => {
                 let a = args.replace("{shell}", "fish");
-                let call = if a.trim().is_empty() {
+                let a = a.trim();
+                let call = if a.is_empty() {
                     format!("{} | source", cmd)
                 } else {
-                    format!("{} {} | source", cmd, a.trim())
+                    format!("{} {} | source", cmd, a)
                 };
                 vec![self.indent(call, d)]
             }
@@ -40,19 +45,23 @@ impl FishEmitter {
 
     fn cond(&self, c: &Cond) -> String {
         match c {
-            Cond::Have(cmd) =>
-                format!("type -q {}", cmd),
+            Cond::Have(cmd) => format!("type -q {}", cmd),
             Cond::Os(name) => {
                 let uname = match name.as_str() {
-                    "darwin"  => "Darwin",
-                    "linux"   => "Linux",
+                    "darwin" => "Darwin",
+                    "linux" => "Linux",
                     "windows" => "Windows_NT",
-                    other     => other,
+                    other => other,
                 };
                 format!("test (uname -s) = \"{}\"", uname)
             }
-            Cond::Shell(name) =>
-                if name == "fish" { "true".into() } else { "false".into() },
+            Cond::Shell(name) => {
+                if name == "fish" {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            }
         }
     }
 
@@ -85,31 +94,46 @@ mod tests {
 
     #[test]
     fn set() {
-        let out = render(&[Node::Set { key: "EDITOR".into(), val: "nvim".into() }]);
+        let out = render(&[Node::Set {
+            key: "EDITOR".into(),
+            val: "nvim".into(),
+        }]);
         assert_eq!(out, "set -gx EDITOR \"nvim\"");
     }
 
     #[test]
     fn path_prepend() {
-        let out = render(&[Node::Path { dir: "/usr/local/bin".into(), prepend: true }]);
+        let out = render(&[Node::Path {
+            dir: "/usr/local/bin".into(),
+            prepend: true,
+        }]);
         assert_eq!(out, "fish_add_path -gP \"/usr/local/bin\"");
     }
 
     #[test]
     fn path_append() {
-        let out = render(&[Node::Path { dir: "/opt/bin".into(), prepend: false }]);
+        let out = render(&[Node::Path {
+            dir: "/opt/bin".into(),
+            prepend: false,
+        }]);
         assert_eq!(out, "fish_add_path -gaP \"/opt/bin\"");
     }
 
     #[test]
     fn inject_with_shell_placeholder() {
-        let out = render(&[Node::Inject { cmd: "starship".into(), args: "init {shell}".into() }]);
+        let out = render(&[Node::Inject {
+            cmd: "starship".into(),
+            args: "init {shell}".into(),
+        }]);
         assert_eq!(out, "starship init fish | source");
     }
 
     #[test]
     fn inject_no_args() {
-        let out = render(&[Node::Inject { cmd: "myprog".into(), args: String::new() }]);
+        let out = render(&[Node::Inject {
+            cmd: "myprog".into(),
+            args: String::new(),
+        }]);
         assert_eq!(out, "myprog | source");
     }
 
@@ -120,12 +144,18 @@ mod tests {
 
     #[test]
     fn cond_os_darwin() {
-        assert_eq!(FishEmitter.cond(&Cond::Os("darwin".into())), "test (uname -s) = \"Darwin\"");
+        assert_eq!(
+            FishEmitter.cond(&Cond::Os("darwin".into())),
+            "test (uname -s) = \"Darwin\""
+        );
     }
 
     #[test]
     fn cond_os_linux() {
-        assert_eq!(FishEmitter.cond(&Cond::Os("linux".into())), "test (uname -s) = \"Linux\"");
+        assert_eq!(
+            FishEmitter.cond(&Cond::Os("linux".into())),
+            "test (uname -s) = \"Linux\""
+        );
     }
 
     #[test]
@@ -141,42 +171,62 @@ mod tests {
     #[test]
     fn if_end() {
         let node = Node::If(IfNode {
-            cond:  Cond::Have("git".into()),
-            body:  vec![Node::Set { key: "X".into(), val: "1".into() }],
+            cond: Cond::Have("git".into()),
+            body: vec![Node::Set {
+                key: "X".into(),
+                val: "1".into(),
+            }],
             elifs: vec![],
             else_: vec![],
         });
         let out = render(&[node]);
         assert!(out.contains("if type -q git"), "missing if: {}", out);
-        assert!(out.contains("set -gx X"),      "missing body: {}", out);
-        assert!(out.contains("end"),             "missing end: {}", out);
+        assert!(out.contains("set -gx X"), "missing body: {}", out);
+        assert!(out.contains("end"), "missing end: {}", out);
     }
 
     #[test]
     fn if_elif_else_end() {
         let node = Node::If(IfNode {
-            cond:  Cond::Os("darwin".into()),
-            body:  vec![Node::Set { key: "A".into(), val: "1".into() }],
-            elifs: vec![(Cond::Os("linux".into()),
-                         vec![Node::Set { key: "A".into(), val: "2".into() }])],
-            else_: vec![Node::Set { key: "A".into(), val: "3".into() }],
+            cond: Cond::Os("darwin".into()),
+            body: vec![Node::Set {
+                key: "A".into(),
+                val: "1".into(),
+            }],
+            elifs: vec![(
+                Cond::Os("linux".into()),
+                vec![Node::Set {
+                    key: "A".into(),
+                    val: "2".into(),
+                }],
+            )],
+            else_: vec![Node::Set {
+                key: "A".into(),
+                val: "3".into(),
+            }],
         });
         let out = render(&[node]);
         assert!(out.contains("else if"), "missing else if: {}", out);
-        assert!(out.contains("else"),    "missing else: {}",    out);
-        assert!(out.contains("end"),     "missing end: {}",     out);
+        assert!(out.contains("else"), "missing else: {}", out);
+        assert!(out.contains("end"), "missing end: {}", out);
     }
 
     #[test]
     fn indent_depth() {
         let node = Node::If(IfNode {
-            cond:  Cond::Have("cargo".into()),
-            body:  vec![Node::Set { key: "Y".into(), val: "z".into() }],
+            cond: Cond::Have("cargo".into()),
+            body: vec![Node::Set {
+                key: "Y".into(),
+                val: "z".into(),
+            }],
             elifs: vec![],
             else_: vec![],
         });
         let out = render(&[node]);
-        assert!(out.lines().any(|l| l.starts_with("  set -gx")),
-            "body not indented: {}", out);
+        assert!(
+            out.lines().any(|l| l.starts_with("  set -gx")),
+            "body not indented: {}",
+            out
+        );
     }
 }

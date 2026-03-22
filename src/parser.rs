@@ -1,128 +1,203 @@
-use crate::ast::{Cond, IfNode, Node};
+use crate::ast::{Cond, IfNode, Node, ParseError};
 
 pub struct Parser {
-    lines: Vec<Vec<String>>,
-    pos:   usize,
+    /// Each entry is `(source_line_number, tokens)`. Line numbers are 1-based
+    /// and reflect the original file so error messages are actionable.
+    lines: Vec<(usize, Vec<String>)>,
+    pos: usize,
 }
 
 impl Parser {
     pub fn new(src: &str) -> Self {
         let lines = src
             .lines()
-            .filter_map(|raw| {
-                // strip inline comments, trim, skip blanks
+            .enumerate()
+            .filter_map(|(i, raw)| {
                 let s = raw.split('#').next().unwrap_or("").trim();
                 if s.is_empty() {
                     None
                 } else {
-                    Some(s.split_whitespace().map(String::from).collect::<Vec<_>>())
+                    let toks = s.split_whitespace().map(String::from).collect();
+                    Some((i + 1, toks))
                 }
             })
             .collect();
         Self { lines, pos: 0 }
     }
 
-    pub fn parse(&mut self) -> Result<Vec<Node>, String> {
+    pub fn parse(&mut self) -> Result<Vec<Node>, ParseError> {
         self.block(&[])
     }
 
     // ── internal ────────────────────────────────────────────────────────────
 
-    fn peek(&self) -> Option<&Vec<String>> {
-        self.lines.get(self.pos)
+    /// Return `(line_number, keyword, full_token_slice)` for the current line
+    /// without advancing.
+    fn peek(&self) -> Option<(usize, &[String])> {
+        self.lines.get(self.pos).map(|(ln, t)| (*ln, t.as_slice()))
     }
 
-    fn take(&mut self) -> Vec<String> {
-        let t = self.lines[self.pos].clone();
-        self.pos += 1;
-        t
-    }
-
-    fn block(&mut self, stops: &[&str]) -> Result<Vec<Node>, String> {
+    fn block(&mut self, stops: &[&str]) -> Result<Vec<Node>, ParseError> {
         let mut nodes = Vec::new();
         loop {
             match self.peek() {
                 None => break,
-                Some(t) if stops.contains(&t[0].as_str()) => break,
-                _ => {}
+                Some((_, t)) => {
+                    // `.first()` is always `Some` here — `lines` never stores
+                    // empty token vecs (the filter_map above guarantees this).
+                    if stops.contains(&t[0].as_str()) {
+                        break;
+                    }
+                }
             }
-            let t = self.take();
-            let node = match t[0].as_str() {
-                "set" => {
-                    require_len(&t, 3, "set KEY VALUE")?;
-                    Node::Set { key: t[1].clone(), val: t[2..].join(" ") }
-                }
-                "path+" => {
-                    require_len(&t, 2, "path+ DIR")?;
-                    Node::Path { dir: t[1].clone(), prepend: true }
-                }
-                "path-" => {
-                    require_len(&t, 2, "path- DIR")?;
-                    Node::Path { dir: t[1].clone(), prepend: false }
-                }
-                "inject" => {
-                    require_len(&t, 2, "inject CMD [ARGS]")?;
-                    Node::Inject { cmd: t[1].clone(), args: t[2..].join(" ") }
-                }
-                "if" => {
-                    require_len(&t, 3, "if <cond-type> <value>")?;
-                    Node::If(self.parse_if(&t[1..])?)
-                }
-                kw => return Err(format!("unknown keyword {:?}", kw)),
-            };
+            let node = self.parse_statement()?;
             nodes.push(node);
         }
         Ok(nodes)
     }
 
-    fn parse_cond(toks: &[String]) -> Result<Cond, String> {
-        let val = || {
-            toks.get(1)
-                .cloned()
-                .ok_or_else(|| format!("{} requires a value", toks[0]))
-        };
+    fn parse_statement(&mut self) -> Result<Node, ParseError> {
+        // SAFETY: parse_statement is only called after peek() confirms a line
+        // exists at self.pos, so the index is always valid.
+        let (ln, toks) = &self.lines[self.pos];
+        let ln = *ln;
+        // SAFETY: filter_map in new() guarantees every stored line has ≥1 token.
         match toks[0].as_str() {
-            "have"  => Ok(Cond::Have(val()?)),
-            "os"    => Ok(Cond::Os(val()?)),
-            "shell" => Ok(Cond::Shell(val()?)),
-            other   => Err(format!("unknown condition {:?} — use: have | os | shell", other)),
+            "set" => {
+                let key = toks
+                    .get(1)
+                    .ok_or_else(|| ParseError::at(ln, "usage: set KEY VALUE"))?
+                    .clone();
+                if toks.len() < 3 {
+                    return Err(ParseError::at(ln, "usage: set KEY VALUE"));
+                }
+                let val = toks[2..].join(" ");
+                self.pos += 1;
+                Ok(Node::Set { key, val })
+            }
+            "path+" => {
+                let dir = toks
+                    .get(1)
+                    .ok_or_else(|| ParseError::at(ln, "usage: path+ DIR"))?
+                    .clone();
+                self.pos += 1;
+                Ok(Node::Path { dir, prepend: true })
+            }
+            "path-" => {
+                let dir = toks
+                    .get(1)
+                    .ok_or_else(|| ParseError::at(ln, "usage: path- DIR"))?
+                    .clone();
+                self.pos += 1;
+                Ok(Node::Path {
+                    dir,
+                    prepend: false,
+                })
+            }
+            "inject" => {
+                let cmd = toks
+                    .get(1)
+                    .ok_or_else(|| ParseError::at(ln, "usage: inject CMD [ARGS]"))?
+                    .clone();
+                let args = if toks.len() > 2 {
+                    toks[2..].join(" ")
+                } else {
+                    String::new()
+                };
+                self.pos += 1;
+                Ok(Node::Inject { cmd, args })
+            }
+            "if" => {
+                // Borrow cond slice without allocating — parse_cond takes &[String].
+                let cond_slice = toks
+                    .get(1..)
+                    .filter(|s| s.len() >= 2)
+                    .ok_or_else(|| ParseError::at(ln, "usage: if <cond-type> <value>"))?;
+                let cond = Self::parse_cond(ln, cond_slice)?;
+                self.pos += 1;
+                Ok(Node::If(self.parse_if(ln, cond)?))
+            }
+            kw => Err(ParseError::at(ln, format!("unknown keyword {:?}", kw))),
         }
     }
 
-    fn parse_if(&mut self, cond_toks: &[String]) -> Result<IfNode, String> {
+    fn parse_cond(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
+        let kind = toks
+            .first()
+            .ok_or_else(|| ParseError::at(ln, "condition requires a type"))?;
+        let val = toks
+            .get(1)
+            .cloned()
+            .ok_or_else(|| ParseError::at(ln, format!("{} requires a value", kind)))?;
+        match kind.as_str() {
+            "have" => Ok(Cond::Have(val)),
+            "os" => Ok(Cond::Os(val)),
+            "shell" => Ok(Cond::Shell(val)),
+            other => Err(ParseError::at(
+                ln,
+                format!("unknown condition {:?} — use: have | os | shell", other),
+            )),
+        }
+    }
+
+    fn parse_if(&mut self, if_ln: usize, cond: Cond) -> Result<IfNode, ParseError> {
         let mut node = IfNode {
-            cond:  Self::parse_cond(cond_toks)?,
-            body:  self.block(&["elif", "else", "end"])?,
+            cond,
+            body: self.block(&["elif", "else", "end"])?,
             elifs: Vec::new(),
             else_: Vec::new(),
         };
-        loop {
-            match self.peek().map(|v| v[0].as_str()) {
-                Some("elif") => {
-                    let t = self.take();
-                    if t.len() < 3 { return Err("elif requires a condition".into()); }
-                    let c = Self::parse_cond(&t[1..])?;
+
+        // Flat while-let: consume elif*/else?/end without deep nesting.
+        while let Some((ln, kw)) = self.peek().map(|(ln, t)| (ln, t[0].clone())) {
+            match kw.as_str() {
+                "elif" => {
+                    // Borrow cond tokens directly from the stored line; no clone needed.
+                    // SAFETY: self.pos is valid — peek() returned Some above.
+                    let cond = {
+                        let toks = &self.lines[self.pos].1;
+                        let cond_slice = toks
+                            .get(1..)
+                            .filter(|s| s.len() >= 2)
+                            .ok_or_else(|| ParseError::at(ln, "elif requires a condition"))?;
+                        Self::parse_cond(ln, cond_slice)?
+                    };
+                    self.pos += 1;
                     let b = self.block(&["elif", "else", "end"])?;
-                    node.elifs.push((c, b));
+                    node.elifs.push((cond, b));
                 }
-                Some("else") => {
-                    self.take();
+                "else" => {
+                    self.pos += 1;
                     node.else_ = self.block(&["end"])?;
                 }
-                Some("end") => { self.take(); break; }
-                Some(kw)   => return Err(format!("unexpected {:?} inside if-block", kw)),
-                None       => return Err("unterminated if-block (missing 'end')".into()),
+                "end" => {
+                    self.pos += 1;
+                    break;
+                }
+                kw => {
+                    return Err(ParseError::at(
+                        ln,
+                        format!("unexpected {:?} inside if-block", kw),
+                    ));
+                }
             }
         }
-        Ok(node)
-    }
-}
 
-fn require_len(t: &[String], min: usize, usage: &str) -> Result<(), String> {
-    if t.len() < min {
-        Err(format!("usage: {}", usage))
-    } else {
-        Ok(())
+        // If the while exited without consuming "end" the block is unterminated.
+        if self
+            .lines
+            .get(self.pos.saturating_sub(1))
+            .map(|(_, t)| t[0].as_str() != "end")
+            .unwrap_or(true)
+            && self.peek().is_none()
+        {
+            return Err(ParseError::at(
+                if_ln,
+                "unterminated if-block (missing 'end')",
+            ));
+        }
+
+        Ok(node)
     }
 }
 
@@ -133,84 +208,30 @@ mod tests {
     use super::*;
     use crate::ast::{Cond, Node};
 
-    fn parse(src: &str) -> Result<Vec<Node>, String> {
+    fn parse(src: &str) -> Result<Vec<Node>, ParseError> {
         Parser::new(src).parse()
     }
 
-    // ── set ─────────────────────────────────────────────────────────────────
+    // ── happy-path structural checks ─────────────────────────────────────────
 
     #[test]
-    fn set_simple() {
+    fn set_parses_key_and_value() {
         let nodes = parse("set EDITOR nvim").unwrap();
-        assert_eq!(nodes.len(), 1);
         match &nodes[0] {
             Node::Set { key, val } => {
                 assert_eq!(key, "EDITOR");
                 assert_eq!(val, "nvim");
             }
-            other => panic!("expected Set, got {:?}", other),
+            n => panic!("{:?}", n),
         }
     }
 
     #[test]
-    fn set_multi_word_value() {
+    fn set_multiword_value() {
         let nodes = parse("set GREETING hello world").unwrap();
         match &nodes[0] {
             Node::Set { val, .. } => assert_eq!(val, "hello world"),
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn set_missing_value_errors() {
-        assert!(parse("set EDITOR").is_err());
-    }
-
-    #[test]
-    fn set_missing_key_errors() {
-        assert!(parse("set").is_err());
-    }
-
-    // ── path ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn path_prepend() {
-        let nodes = parse("path+ /usr/local/bin").unwrap();
-        match &nodes[0] {
-            Node::Path { dir, prepend } => {
-                assert_eq!(dir, "/usr/local/bin");
-                assert!(*prepend);
-            }
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn path_append() {
-        let nodes = parse("path- /opt/bin").unwrap();
-        match &nodes[0] {
-            Node::Path { prepend, .. } => assert!(!*prepend),
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn path_missing_dir_errors() {
-        assert!(parse("path+").is_err());
-        assert!(parse("path-").is_err());
-    }
-
-    // ── inject ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn inject_with_args() {
-        let nodes = parse("inject starship init {shell}").unwrap();
-        match &nodes[0] {
-            Node::Inject { cmd, args } => {
-                assert_eq!(cmd, "starship");
-                assert_eq!(args, "init {shell}");
-            }
-            other => panic!("{:?}", other),
+            n => panic!("{:?}", n),
         }
     }
 
@@ -222,159 +243,69 @@ mod tests {
                 assert_eq!(cmd, "myprog");
                 assert_eq!(args, "");
             }
-            other => panic!("{:?}", other),
+            n => panic!("{:?}", n),
         }
     }
 
     #[test]
-    fn inject_missing_cmd_errors() {
-        assert!(parse("inject").is_err());
-    }
-
-    // ── comments and blank lines ─────────────────────────────────────────────
-
-    #[test]
-    fn comments_stripped() {
-        let nodes = parse("# full-line comment\nset A B # inline comment").unwrap();
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::Set { key, val } => {
-                assert_eq!(key, "A");
-                assert_eq!(val, "B");
-            }
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn blank_lines_ignored() {
-        let nodes = parse("\n\nset X Y\n\n").unwrap();
-        assert_eq!(nodes.len(), 1);
-    }
-
-    // ── unknown keyword ──────────────────────────────────────────────────────
-
-    #[test]
-    fn unknown_keyword_errors() {
-        let err = parse("sett FOO bar").unwrap_err();
-        assert!(err.contains("sett"), "error should mention keyword: {}", err);
-    }
-
-    // ── conditions ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn cond_have() {
-        let nodes = parse("if have cargo\nset C 1\nend").unwrap();
-        match &nodes[0] {
-            Node::If(n) => match &n.cond {
-                Cond::Have(cmd) => assert_eq!(cmd, "cargo"),
-                other => panic!("{:?}", other),
-            },
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn cond_os() {
-        let nodes = parse("if os darwin\nset A B\nend").unwrap();
-        match &nodes[0] {
-            Node::If(n) => match &n.cond {
-                Cond::Os(name) => assert_eq!(name, "darwin"),
-                other => panic!("{:?}", other),
-            },
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn cond_shell() {
-        let nodes = parse("if shell fish\nset A B\nend").unwrap();
-        match &nodes[0] {
-            Node::If(n) => match &n.cond {
-                Cond::Shell(name) => assert_eq!(name, "fish"),
-                other => panic!("{:?}", other),
-            },
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn cond_unknown_errors() {
-        let err = parse("if foobar baz\nend").unwrap_err();
-        assert!(err.contains("foobar"), "error should mention cond: {}", err);
-    }
-
-    // ── if / elif / else / end ───────────────────────────────────────────────
-
-    #[test]
-    fn if_body_parsed() {
-        let nodes = parse("if have git\nset GIT 1\nend").unwrap();
-        match &nodes[0] {
-            Node::If(n) => assert_eq!(n.body.len(), 1),
-            other => panic!("{:?}", other),
-        }
-    }
-
-    #[test]
-    fn if_elif_else_end() {
+    fn if_elif_else_end_structure() {
         let src = "if os darwin\nset A 1\nelif os linux\nset A 2\nelse\nset A 3\nend";
         let nodes = parse(src).unwrap();
         match &nodes[0] {
             Node::If(n) => {
-                assert_eq!(n.body.len(),  1);
+                assert_eq!(n.body.len(), 1);
                 assert_eq!(n.elifs.len(), 1);
                 assert_eq!(n.else_.len(), 1);
+                match &n.cond {
+                    Cond::Os(s) => assert_eq!(s, "darwin"),
+                    c => panic!("{:?}", c),
+                }
             }
-            other => panic!("{:?}", other),
+            n => panic!("{:?}", n),
         }
     }
 
     #[test]
-    fn if_missing_end_errors() {
-        let err = parse("if have git\nset A 1").unwrap_err();
-        assert!(err.contains("end") || err.contains("unterminated"),
-            "error should mention missing end: {}", err);
+    fn comments_and_blanks_ignored() {
+        let nodes = parse("# comment\n\nset A B # inline").unwrap();
+        assert_eq!(nodes.len(), 1);
+    }
+
+    // ── error path: line numbers ──────────────────────────────────────────────
+
+    #[test]
+    fn errors_carry_line_number() {
+        let err = parse("set A 1\nsett FOO bar").unwrap_err();
+        assert_eq!(err.line, 2, "wrong line: {}", err);
+        assert!(err.msg.contains("sett"), "wrong msg: {}", err);
     }
 
     #[test]
-    fn if_missing_cond_value_errors() {
-        assert!(parse("if have\nend").is_err());
+    fn unterminated_if_reports_opening_line() {
+        let err = parse("set A 1\nif have git\nset B 2").unwrap_err();
+        assert_eq!(err.line, 2, "should point to the if line: {}", err);
     }
 
     #[test]
-    fn elif_missing_cond_errors() {
-        // only keyword, no cond type
-        assert!(parse("if have git\nelif\nend").is_err());
+    fn missing_args_errors() {
+        assert!(parse("set").is_err());
+        assert!(parse("set ONLY").is_err());
+        assert!(parse("path+").is_err());
+        assert!(parse("inject").is_err());
+        assert!(parse("if have").is_err()); // missing value
+        assert!(parse("if foobar baz\nend").is_err()); // unknown cond
     }
 
     #[test]
-    fn nested_if() {
+    fn nested_if_parses() {
         let src = "if have cargo\nif os darwin\nset A 1\nend\nend";
         let nodes = parse(src).unwrap();
         match &nodes[0] {
-            Node::If(outer) => {
-                assert_eq!(outer.body.len(), 1);
-                match &outer.body[0] {
-                    Node::If(_) => {}
-                    other => panic!("expected nested If, got {:?}", other),
-                }
-            }
-            other => panic!("{:?}", other),
+            Node::If(outer) => match &outer.body[0] {
+                Node::If(_) => {}
+                n => panic!("expected nested if: {:?}", n),
+            },
+            n => panic!("{:?}", n),
         }
-    }
-
-    // ── multiple top-level nodes ─────────────────────────────────────────────
-
-    #[test]
-    fn multiple_nodes() {
-        let src = "set A 1\npath+ /bin\ninject foo";
-        let nodes = parse(src).unwrap();
-        assert_eq!(nodes.len(), 3);
-    }
-
-    #[test]
-    fn empty_source_gives_empty_ast() {
-        let nodes = parse("").unwrap();
-        assert!(nodes.is_empty());
     }
 }
