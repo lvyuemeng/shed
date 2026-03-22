@@ -60,7 +60,7 @@ node, no precedence hierarchy, no optional field hiding ambiguity.
     Node
       Set    { key, val }     -- export an environment variable
       Path   { dir, prepend } -- prepend or append to PATH
-      Inject { cmd, args }    -- eval-style initialiser
+      call { cmd, args }    -- eval-style initialiser
       If(IfNode)
         cond  : Cond
         body  : Vec     -- then-branch
@@ -154,84 +154,102 @@ it belongs in a dedicated module.
 
 ---
 
-## Proposal: Compound Conditions (`and`, `or`, `not`)
+## Compound Conditions (`and`, `or`, `not`) -- Operator Precedence
 
-This section records the design rationale so future contributors can evaluate
-the trade-offs before implementing.
+This section documents the implemented syntax and precedence rules for
+compound conditions in the shed DSL.
 
-### Motivation
-
-The current `Cond` is a single predicate: `have <cmd>`, `os <name>`,
-`shell <name>`. Users who need "cargo is installed **and** OS is Linux" today
-must nest two `if` blocks, which is verbose and produces deeper emitted code.
-
-### Design goal
-
-Allow compound conditions in the shed DSL while keeping the parser line-oriented
-and the AST flat. The syntax should look natural and not require parentheses,
-quoting, or character-level scanning.
-
-### Proposed syntax
+### Syntax
 
 ```sh
-# prefix `not` — negate a single condition
+# not (prefix) -- negates one leaf; highest precedence
 if not have cargo
   set CARGO_ABSENT 1
 end
 
-# infix `and` / `or` — combine exactly two conditions on one line
+# and (infix) -- medium precedence
 if have cargo and os linux
   path+ ~/.cargo/bin
 end
 
+# or (infix) -- lowest precedence
 if os darwin or os linux
   set POSIX 1
 end
+
+# mixed: not binds tighter than and, and tighter than or
+if not have cargo and os linux
+  # parsed as: (not have cargo) and (os linux)
+end
+
+if have cargo or not shell fish
+  # parsed as: (have cargo) or (not (shell fish))
+end
 ```
 
-Rules:
-- `not` is a prefix modifier: `not <cond-type> <value>`.
-- `and` / `or` split the token list at the keyword: left-cond `and`/`or` right-cond.
-- Precedence is left-to-right; there are **no parentheses**. Compound chains
-  beyond two conditions are deliberately not supported in v1 — use nested `if`.
-- All tokens remain on a single line so the parser needs no new lookahead.
+### Precedence table (highest to lowest)
 
-### AST changes (`src/ast.rs`)
+| Level | Operator | Arity | Associates |
+|-------|----------|-------|------------|
+| 1 | `not` | prefix | right |
+| 2 | `and` | infix | left |
+| 3 | `or` | infix | left |
 
-```rust
-pub enum Cond {
-    Have(String),
-    Os(String),
-    Shell(String),
-    // New:
-    Not(Box<Cond>),
-    And(Box<Cond>, Box<Cond>),
-    Or(Box<Cond>, Box<Cond>),
-}
-```
+There are **no parentheses** in the DSL. Conditions requiring grouping beyond
+what precedence provides must use nested `if` blocks.
 
-`Box` is justified here because `Cond` is recursive — not because we want
-indirection.
-
-### Parser changes (`src/parser.rs`)
-
-`parse_cond(ln, toks)` is the only function that needs to change.
+### Grammar (EBNF)
 
 ```
-toks = ["not", "have", "cargo"]           → Not(Have("cargo"))
-toks = ["have", "cargo", "and", "os", "linux"] → And(Have("cargo"), Os("linux"))
-toks = ["os", "darwin", "or", "os", "linux"]   → Or(Os("darwin"), Os("linux"))
+cond     = or_expr
+or_expr  = and_expr ( "or"  and_expr )*
+and_expr = not_expr ( "and" not_expr )*
+not_expr = "not" not_expr | leaf
+leaf     = ( "have" | "os" | "shell" ) value
 ```
 
-Algorithm (no backtracking, one pass):
-1. If `toks[0] == "not"`, recurse on `toks[1..]` → `Cond::Not(_)`.
-2. Scan `toks` for `"and"` or `"or"` at positions 2+ (a leaf cond is at least
-   two tokens wide). Split at the first match.
-3. If no combinator found, parse as a leaf cond (current logic).
+Because the DSL is line/token-split, each leaf occupies exactly two tokens.
+The parser locates `or` / `and` by scanning the flat token slice for those
+keywords at positions where a boundary between two leaves can exist (i.e.
+positions 2, 5, 8... for a sequence of two-token leaves, but since `not`
+consumes a prefix the scan uses a right-to-left search for the lowest-
+precedence operator).
 
-### Emitter changes
+### Parser implementation (`src/parser.rs`)
 
-Each emitter's `cond()` method gains arms for `Not`, `And`, `Or`:
+`parse_cond(ln, toks)` is the entry point. It calls three helpers in order
+of descending precedence:
+
+```
+parse_or(ln, toks)
+  scan RIGHT-TO-LEFT for the last "or" where index >= 2 and index+1 < len.
+  split at that position:
+    left  = parse_or(toks[..pos])    -- recurse left for left-associativity
+    right = parse_and(toks[pos+1..]) -- right operand is and-level
+  if none found: delegate to parse_and.
+
+parse_and(ln, toks)
+  scan RIGHT-TO-LEFT for the last "and" where index >= 2 and index+1 < len.
+  split:
+    left  = parse_and(toks[..pos])   -- recurse left for left-associativity
+    right = parse_not(toks[pos+1..]) -- right operand is not-level
+  if none found: delegate to parse_not.
+
+parse_not(ln, toks)
+  if toks[0] == "not": Not(Box::new(parse_not(toks[1..])))
+  else: parse_leaf(toks)
+
+parse_leaf(ln, toks)
+  expects exactly [type, value]; type in {have, os, shell}
+```
+
+Right-to-left scanning for the LAST operator, with left-recursive descent,
+achieves left-associativity:
+  `a and b and c` -- last `and` splits right side off
+  → And(parse_and("a and b"), parse_not("c"))
+  → And(And(a,b), c)     -- left-associative
+
+### Emitter output
 
 | Shell | `Not(c)` | `And(a, b)` | `Or(a, b)` |
 |-------|----------|-------------|------------|
@@ -239,29 +257,113 @@ Each emitter's `cond()` method gains arms for `Not`, `And`, `Or`:
 | fish | `not <c>` | `<a>; and <b>` | `<a>; or <b>` |
 | pwsh | `(-not (<c>))` | `(<a>) -and (<b>)` | `(<a>) -or (<b>)` |
 
-For bash the `cond()` result is embedded in `[ … ]`; compound conditions need
-the brackets dropped and replaced with `[[ … ]]` or `if cmd1 && cmd2`. The
-cleanest approach: emit the cond string raw and let `emit_if` decide the
-wrapping based on whether the cond contains `&&` / `||`. Alternatively,
-add a `Emitter::cond_raw(&self, c: &Cond) -> String` that returns an
-unwrapped expression, and keep bracket-wrapping in `emit_if` only for leaf
-conds.
-
 ### What to avoid
 
-- **Operator precedence** — do not implement it; require explicit nesting instead.
 - **Parentheses in the DSL** — the parser is line/token-split; a paren grammar
   would need a character scanner.
-- **Deep recursion** — limit compound depth to one level in v1. Nesting beyond
-  that can use nested `if` blocks, which already work.
+- **Implicit precedence surprises** -- always document that `not` binds tighter
+  than `and`, which binds tighter than `or`. Add a comment in source if unclear.
 
-### Implementation order
+### Implementation files
 
-1. Extend `Cond` in `ast.rs`.
-2. Update `parse_cond` in `parser.rs`.
-3. Update every emitter's `cond()` — the compiler enforces exhaustiveness.
-4. Add unit tests in each emitter for the new arms.
-5. Add integration tests in `src/tests.rs` (`and`, `or`, `not` across all shells).
+All changes are confined to `src/parser.rs`. The `Cond` AST in `src/ast.rs`
+and all emitters are unchanged.
+
+---
+
+## Semantic Pruning Pass
+
+The pruning pass runs after parsing and before emitting. It is pure: no I/O,
+no global state; the input AST and target shell name are the only inputs.
+
+### Purpose
+
+Conditional blocks guarded by `Cond::Shell` or `Cond::Os` are statically
+known to be always-true or always-false for a specific compilation target.
+Emitting dead branches wastes output lines and can confuse shell linters.
+
+Examples (target = bash):
+
+```
+if shell fish          →  entire block unreachable; prune to nothing
+  ...
+end
+
+if shell bash          →  guard always true; inline the body directly
+  set EDITOR nvim
+end
+
+if os darwin           →  condition unknown at compile time; kept as-is
+  ...
+end
+```
+
+`Cond::Have` is a runtime check (command existence may differ per machine)
+and is never pruned.
+
+`Cond::Os` is known only when the shed file is compiled for a specific
+machine. Because `shed` is a source-to-source compiler targeting multiple
+hosts from one file, `os` conditions are left untouched.
+
+### Pruning rules for `Cond::Shell(name)`
+
+| Condition | Target shell | Result |
+|-----------|-------------|--------|
+| `Shell(s)` where `s == target` | any | always-true → inline body |
+| `Shell(s)` where `s != target` | any | always-false → drop branch |
+
+### Pruning rules for compound conditions
+
+The pass reduces compound `Cond` nodes before deciding branch fate:
+
+- `Not(always-true)`  → always-false
+- `Not(always-false)` → always-true
+- `And(always-false, _)` or `And(_, always-false)` → always-false (short-circuit)
+- `And(always-true,  c)` → reduce to `c`
+- `Or(always-true,  _)` or `Or(_, always-true)`  → always-true (short-circuit)
+- `Or(always-false, c)` → reduce to `c`
+
+A `Cond` that cannot be fully resolved stays as a `Cond` node and is emitted
+normally.
+
+### Branch outcome
+
+After condition evaluation:
+
+- **Always-true body** — replace `Node::If(inode)` with the body nodes
+  inlined into the parent list. `elif` / `else` branches are dropped.
+- **Always-false body** — check `elifs` in order; the first elif whose
+  condition is also always-true is inlined. If no elif matches, the `else_`
+  block (if present) is inlined. If nothing matches the node is dropped.
+- **Unknown** — the `IfNode` is kept but its `body`, `elifs`, and `else_`
+  are recursively pruned.
+
+### Implementation location
+
+```
+src/
+  prune.rs    — prune_nodes(nodes, shell) -> Vec<Node>
+                prune_cond(cond, shell)   -> CondResult
+```
+
+`CondResult` is a local enum:
+
+```rust
+enum CondResult {
+    AlwaysTrue,
+    AlwaysFalse,
+    Unknown(Cond),
+}
+```
+
+The pass is wired into `main.rs` between `resolve_paths` and `emit`:
+
+```
+read → parse → resolve_paths → prune_nodes → emit
+```
+
+`prune_nodes` takes the target shell name as a `&str` so it remains pure
+and testable without constructing an `Emitter`.
 
 No other files need to change.
 
@@ -271,7 +373,7 @@ No other files need to change.
 
   Symbol table / var resolution  -- DSL has no user-defined variables
   Type system                    -- all values are strings; no type errors
-  Optimisation pass              -- output correctness matters more than brevity
+  General optimisation pass      -- output correctness matters more than brevity
   Plugin / dynamic loading       -- shell set is closed; static dispatch wins
   Runtime configuration file     -- all behaviour driven by the .shed source
   IR between parser and emitter  -- the AST is the IR; no lowering needed
@@ -321,7 +423,7 @@ Change surface.  ast.rs (new ValuePart type), parser.rs, all four emitters.
 
 Problem.
   Shell aliases are the second most common env-file entry after exports.
-  Users currently need inject or separate per-shell files.
+  Users currently need call or separate per-shell files.
 
 Approach.
   Add Node::Alias { name: String, body: String }. Emitters render:

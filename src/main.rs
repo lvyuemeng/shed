@@ -1,6 +1,7 @@
 mod ast;
 mod emit;
 mod parser;
+mod prune;
 #[cfg(test)]
 mod tests;
 
@@ -14,6 +15,7 @@ use std::{
 use ast::Node;
 use emit::{Emitter, bash::BashEmitter, fish::FishEmitter, pwsh::PwshEmitter};
 use parser::Parser;
+use prune::prune_nodes;
 
 const USAGE: &str = "\
 shed — Shell Environment Declaration
@@ -35,17 +37,26 @@ DSL REFERENCE
   set   KEY value             export an env var
   path+ dir                   prepend dir to PATH
   path- dir                   append  dir to PATH
-  inject cmd [args]           eval-init (starship, zoxide, …)
+  call cmd [args]             eval-init (starship, zoxide, …)
                               use {shell} as a placeholder for the target shell name
 
   if    have  <cmd>           guard: command must exist on PATH
   if    os    darwin|linux|windows
   if    shell bash|zsh|fish|pwsh
+  if    not   <cond>          negate a condition
+  if    <cond> and <cond>     both conditions must hold
+  if    <cond> or  <cond>     either condition must hold
   elif  …
   else
   end
 
   # comment (inline or full-line)
+
+  COMPOUND CONDITIONS (precedence: not > and > or)
+  if not have cargo              negate a single condition
+  if have cargo and os linux     both must hold
+  if os darwin or os linux       either holds
+  if not have cargo and os linux parsed as: (not have cargo) and (os linux)
 ";
 
 fn read(path: Option<&str>) -> Result<String, String> {
@@ -148,18 +159,27 @@ fn emit(shell: &str, ast: &[Node]) -> Result<String, String> {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    // --help / -h anywhere in the args prints usage and exits cleanly.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", USAGE);
+        return Ok(());
+    }
+
     let shell = args.get(1).map(String::as_str).ok_or(USAGE)?;
     let file = args.get(2).map(String::as_str);
     let base = base_dir(file);
 
-    let ast = read(file)
+    // For `check` we skip pruning so the node count reflects the raw parse.
+    let parsed = read(file)
         .and_then(|src| Parser::new(&src).parse().map_err(|e| e.to_string()))
         .map(|nodes| resolve_paths(nodes, base.as_deref()))?;
 
     if shell == "check" {
-        println!("ok ({} top-level nodes)", ast.len());
+        println!("ok ({} top-level nodes)", parsed.len());
         return Ok(());
     }
+
+    let ast = prune_nodes(parsed, shell);
 
     emit(shell, &ast).map(|out| println!("{}", out))
 }

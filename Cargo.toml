@@ -9,3 +9,15 @@ repository  = "https://github.com/lvyuemeng/shed"
 [[bin]]
 name = "shed"
 path = "src/main.rs"
+
+[profile.release]
+# Maximum optimisation — inlines aggressively, enables auto-vectorisation.
+opt-level     = 3
+# Strip all symbols from the final binary (smallest possible size).
+strip         = true
+# Enable link-time optimisation across all compilation units.
+lto           = true
+# One codegen unit maximises LTO effectiveness at the cost of slower builds.
+codegen-units = 1
+# Abort on panic instead of unwinding — removes the unwinder from the binary.
+panic         = "abort"

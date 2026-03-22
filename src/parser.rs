@@ -56,35 +56,27 @@ impl Parser {
         // SAFETY: filter_map in new() guarantees every stored line has >=1 token.
         match toks[0].as_str() {
             "set" => {
-                let key = toks
-                    .get(1)
-                    .ok_or_else(|| ParseError::at(ln, "usage: set KEY VALUE"))?
-                    .clone();
                 if toks.len() < 3 {
                     return Err(ParseError::at(ln, "usage: set KEY VALUE"));
                 }
+                let key = toks[1].clone();
                 let val = toks[2..].join(" ");
                 self.pos += 1;
                 Ok(Node::Set { key, val })
             }
             kw @ ("path+" | "path-") => {
                 let prepend = kw == "path+";
-                let usage = if prepend {
-                    "usage: path+ DIR"
-                } else {
-                    "usage: path- DIR"
-                };
                 let dir = toks
                     .get(1)
-                    .ok_or_else(|| ParseError::at(ln, usage))?
+                    .ok_or_else(|| ParseError::at(ln, format!("usage: {} DIR", kw)))?
                     .clone();
                 self.pos += 1;
                 Ok(Node::Path { dir, prepend })
             }
-            "inject" => {
+            "call" => {
                 let cmd = toks
                     .get(1)
-                    .ok_or_else(|| ParseError::at(ln, "usage: inject CMD [ARGS]"))?
+                    .ok_or_else(|| ParseError::at(ln, "usage: call CMD [ARGS]"))?
                     .clone();
                 let args = toks
                     .get(2..)
@@ -92,7 +84,7 @@ impl Parser {
                     .map(|s| s.join(" "))
                     .unwrap_or_default();
                 self.pos += 1;
-                Ok(Node::Inject { cmd, args })
+                Ok(Node::Call { cmd, args })
             }
             "if" => {
                 // toks[1..] is the condition token list; must be non-empty.
@@ -109,32 +101,70 @@ impl Parser {
     }
 
     fn parse_cond(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
-        // prefix `not` -- negate a single condition
+        Self::parse_or(ln, toks)
+    }
+
+    /// Lowest precedence: `or`. Left-associative.
+    ///
+    /// Left-associativity requires splitting at the LAST `or` (rightmost
+    /// operator at this precedence level), then recursing `parse_or` on
+    /// the LEFT subtree. The right side is parsed by `parse_and`.
+    ///
+    /// Example: `a or b or c`
+    ///   last `or` at position of second `or`
+    ///   → Or(parse_or("a or b"), parse_and("c"))
+    ///   → Or(Or(a,b), c)  -- left-associative
+    fn parse_or(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
+        if let Some(op) = toks
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, t)| (t == "or" && i >= 2 && i + 1 < toks.len()).then_some(i))
+        {
+            let left = Self::parse_or(ln, &toks[..op])?;
+            let right = Self::parse_and(ln, &toks[op + 1..])?;
+            return Ok(Cond::Or(Box::new(left), Box::new(right)));
+        }
+        Self::parse_and(ln, toks)
+    }
+
+    /// Medium precedence: `and`. Left-associative.
+    ///
+    /// Same strategy: split at the LAST `and`, recurse `parse_and` on the
+    /// left, delegate the right to `parse_not`.
+    ///
+    /// Example: `a and b and c`
+    ///   last `and` at position of second `and`
+    ///   → And(parse_and("a and b"), parse_not("c"))
+    ///   → And(And(a,b), c)  -- left-associative
+    fn parse_and(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
+        if let Some(op) = toks
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, t)| (t == "and" && i >= 2 && i + 1 < toks.len()).then_some(i))
+        {
+            let left = Self::parse_and(ln, &toks[..op])?;
+            let right = Self::parse_not(ln, &toks[op + 1..])?;
+            return Ok(Cond::And(Box::new(left), Box::new(right)));
+        }
+        Self::parse_not(ln, toks)
+    }
+
+    /// Highest precedence: prefix `not`. Right-associative (naturally).
+    fn parse_not(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
         if toks.first().map(|s| s.as_str()) == Some("not") {
             let rest = toks
                 .get(1..)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| ParseError::at(ln, "not requires a condition"))?;
-            return Ok(Cond::Not(Box::new(Self::parse_cond(ln, rest)?)));
+                .ok_or_else(|| ParseError::at(ln, "'not' requires a condition"))?;
+            return Ok(Cond::Not(Box::new(Self::parse_not(ln, rest)?)));
         }
+        Self::parse_leaf(ln, toks)
+    }
 
-        // infix `and` / `or` -- scan from position 2 (a leaf cond is >=2 tokens)
-        if let Some(op_pos) = toks
-            .iter()
-            .enumerate()
-            .skip(2)
-            .find_map(|(i, t)| (t == "and" || t == "or").then_some(i))
-        {
-            let left = Self::parse_cond(ln, &toks[..op_pos])?;
-            let right = Self::parse_cond(ln, &toks[op_pos + 1..])?;
-            return Ok(if toks[op_pos] == "and" {
-                Cond::And(Box::new(left), Box::new(right))
-            } else {
-                Cond::Or(Box::new(left), Box::new(right))
-            });
-        }
-
-        // leaf cond: <type> <value>
+    /// Parse a leaf condition: `<type> <value>`.
+    fn parse_leaf(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
         let kind = toks
             .first()
             .ok_or_else(|| ParseError::at(ln, "condition requires a type"))?;
@@ -161,13 +191,16 @@ impl Parser {
             else_: Vec::new(),
         };
 
-        // Flat while-let: consume elif*/else?/end without deep nesting.
-        // `terminated` tracks whether `end` was consumed; missing closer is caught below.
-        let mut terminated = false;
-        while let Some((ln, kw)) = self.peek().map(|(ln, t)| (ln, t[0].clone())) {
-            match kw.as_str() {
-                "elif" => {
-                    // SAFETY: self.pos is valid -- peek() returned Some above.
+        // Flat loop: consume elif*/else?/end; return Ok on `end`, error on EOF.
+        loop {
+            match self.peek().map(|(ln, t)| (ln, t[0].clone())) {
+                None => break,
+                Some((_, kw)) if kw == "end" => {
+                    self.pos += 1;
+                    return Ok(node);
+                }
+                Some((ln, kw)) if kw == "elif" => {
+                    // SAFETY: peek() returned Some above.
                     let cond = {
                         let toks = &self.lines[self.pos].1;
                         let cond_slice = toks
@@ -180,16 +213,11 @@ impl Parser {
                     let b = self.block(&["elif", "else", "end"])?;
                     node.elifs.push((cond, b));
                 }
-                "else" => {
+                Some((_, kw)) if kw == "else" => {
                     self.pos += 1;
                     node.else_ = self.block(&["end"])?;
                 }
-                "end" => {
-                    self.pos += 1;
-                    terminated = true;
-                    break;
-                }
-                kw => {
+                Some((ln, kw)) => {
                     return Err(ParseError::at(
                         ln,
                         format!("unexpected {:?} inside if-block", kw),
@@ -198,14 +226,10 @@ impl Parser {
             }
         }
 
-        if !terminated {
-            return Err(ParseError::at(
-                if_ln,
-                "unterminated if-block (missing 'end')",
-            ));
-        }
-
-        Ok(node)
+        Err(ParseError::at(
+            if_ln,
+            "unterminated if-block (missing 'end')",
+        ))
     }
 }
 
@@ -244,10 +268,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_no_args() {
-        let nodes = parse("inject myprog").unwrap();
+    fn call_no_args() {
+        let nodes = parse("call myprog").unwrap();
         match &nodes[0] {
-            Node::Inject { cmd, args } => {
+            Node::Call { cmd, args } => {
                 assert_eq!(cmd, "myprog");
                 assert_eq!(args, "");
             }
@@ -299,7 +323,7 @@ mod tests {
         assert!(parse("set").is_err());
         assert!(parse("set ONLY").is_err());
         assert!(parse("path+").is_err());
-        assert!(parse("inject").is_err());
+        assert!(parse("call").is_err());
         assert!(parse("if have").is_err()); // missing value
         assert!(parse("if foobar baz\nend").is_err()); // unknown cond
     }
@@ -312,6 +336,109 @@ mod tests {
             Node::If(outer) => match &outer.body[0] {
                 Node::If(_) => {}
                 n => panic!("expected nested if: {:?}", n),
+            },
+            n => panic!("{:?}", n),
+        }
+    }
+
+    // -- compound condition precedence ----------------------------------------
+
+    /// not have cargo  →  Not(Have("cargo"))
+    #[test]
+    fn not_leaf() {
+        let nodes = parse("if not have cargo\nend").unwrap();
+        match &nodes[0] {
+            Node::If(n) => {
+                assert!(matches!(&n.cond, Cond::Not(c) if matches!(c.as_ref(), Cond::Have(_))))
+            }
+            n => panic!("{:?}", n),
+        }
+    }
+
+    /// not have cargo and os linux  →  And(Not(Have), Os)  -- not binds tighter than and
+    #[test]
+    fn not_and_precedence() {
+        let nodes = parse("if not have cargo and os linux\nend").unwrap();
+        match &nodes[0] {
+            Node::If(n) => match &n.cond {
+                Cond::And(l, r) => {
+                    assert!(matches!(l.as_ref(), Cond::Not(_)), "lhs should be Not");
+                    assert!(matches!(r.as_ref(), Cond::Os(_)), "rhs should be Os");
+                }
+                c => panic!("expected And, got {:?}", c),
+            },
+            n => panic!("{:?}", n),
+        }
+    }
+
+    /// have cargo or not shell fish  →  Or(Have, Not(Shell))  -- not binds tighter than or
+    #[test]
+    fn or_not_precedence() {
+        let nodes = parse("if have cargo or not shell fish\nend").unwrap();
+        match &nodes[0] {
+            Node::If(n) => match &n.cond {
+                Cond::Or(l, r) => {
+                    assert!(matches!(l.as_ref(), Cond::Have(_)), "lhs should be Have");
+                    assert!(matches!(r.as_ref(), Cond::Not(_)), "rhs should be Not");
+                }
+                c => panic!("expected Or, got {:?}", c),
+            },
+            n => panic!("{:?}", n),
+        }
+    }
+
+    /// have cargo and os linux or shell bash
+    ///   →  Or(And(Have, Os), Shell)  -- and binds tighter than or
+    #[test]
+    fn and_or_precedence() {
+        let nodes = parse("if have cargo and os linux or shell bash\nend").unwrap();
+        match &nodes[0] {
+            Node::If(n) => match &n.cond {
+                Cond::Or(l, r) => {
+                    assert!(matches!(l.as_ref(), Cond::And(_, _)), "lhs should be And");
+                    assert!(matches!(r.as_ref(), Cond::Shell(_)), "rhs should be Shell");
+                }
+                c => panic!("expected Or(And, Shell), got {:?}", c),
+            },
+            n => panic!("{:?}", n),
+        }
+    }
+
+    /// os linux or have cargo and shell bash
+    ///   →  Or(Os, And(Have, Shell))  -- and on the right still binds first
+    #[test]
+    fn or_and_right_precedence() {
+        let nodes = parse("if os linux or have cargo and shell bash\nend").unwrap();
+        match &nodes[0] {
+            Node::If(n) => match &n.cond {
+                Cond::Or(l, r) => {
+                    assert!(matches!(l.as_ref(), Cond::Os(_)), "lhs should be Os");
+                    assert!(matches!(r.as_ref(), Cond::And(_, _)), "rhs should be And");
+                }
+                c => panic!("expected Or(Os, And), got {:?}", c),
+            },
+            n => panic!("{:?}", n),
+        }
+    }
+
+    /// have cargo and os linux and shell bash
+    ///   →  And(And(Have, Os), Shell)  -- left-associative chaining of and
+    #[test]
+    fn and_left_associative() {
+        let nodes = parse("if have cargo and os linux and shell bash\nend").unwrap();
+        match &nodes[0] {
+            Node::If(n) => match &n.cond {
+                Cond::And(l, r) => {
+                    assert!(
+                        matches!(l.as_ref(), Cond::And(_, _)),
+                        "outer lhs should be And(And)"
+                    );
+                    assert!(
+                        matches!(r.as_ref(), Cond::Shell(_)),
+                        "outer rhs should be Shell"
+                    );
+                }
+                c => panic!("expected And(And, Shell), got {:?}", c),
             },
             n => panic!("{:?}", n),
         }

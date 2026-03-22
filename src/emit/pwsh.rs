@@ -18,24 +18,24 @@ impl PwshEmitter {
         match n {
             Node::Set { key, val } => vec![self.indent(format!("$env:{} = \"{}\"", key, val), d)],
 
-            Node::Path { dir, prepend: true } => {
-                vec![self.indent(format!("$env:PATH = \"{};$env:PATH\"", dir), d)]
+            Node::Path { dir, prepend } => {
+                let s = if *prepend {
+                    format!("$env:PATH = \"{};$env:PATH\"", dir)
+                } else {
+                    format!("$env:PATH = \"$env:PATH;{}\"", dir)
+                };
+                vec![self.indent(s, d)]
             }
 
-            Node::Path {
-                dir,
-                prepend: false,
-            } => vec![self.indent(format!("$env:PATH = \"$env:PATH;{}\"", dir), d)],
-
-            Node::Inject { cmd, args } => {
+            Node::Call { cmd, args } => {
                 let a = args.replace("{shell}", "powershell");
                 let a = a.trim();
-                let call = if a.is_empty() {
+                let s = if a.is_empty() {
                     format!("Invoke-Expression (& {})", cmd)
                 } else {
                     format!("Invoke-Expression (& {} {})", cmd, a)
                 };
-                vec![self.indent(call, d)]
+                vec![self.indent(s, d)]
             }
 
             Node::If(node) => self.emit_if(node, d),
@@ -72,10 +72,10 @@ impl PwshEmitter {
             out.extend(self.emit_nodes(b, d + 1));
         }
         if !n.else_.is_empty() {
-            out.push(self.indent("} else {", d));
+            out.push(self.indent("} else {".into(), d));
             out.extend(self.emit_nodes(&n.else_, d + 1));
         }
-        out.push(self.indent("}", d));
+        out.push(self.indent("}".into(), d));
         out
     }
 }
@@ -119,8 +119,8 @@ mod tests {
     }
 
     #[test]
-    fn inject_with_shell_placeholder() {
-        let out = render(&[Node::Inject {
+    fn call_with_shell_placeholder() {
+        let out = render(&[Node::Call {
             cmd: "starship".into(),
             args: "init {shell}".into(),
         }]);
@@ -128,8 +128,8 @@ mod tests {
     }
 
     #[test]
-    fn inject_no_args() {
-        let out = render(&[Node::Inject {
+    fn call_no_args() {
+        let out = render(&[Node::Call {
             cmd: "myprog".into(),
             args: String::new(),
         }]);

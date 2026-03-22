@@ -9,24 +9,29 @@
 use crate::{
     emit::{Emitter, bash::BashEmitter, fish::FishEmitter, pwsh::PwshEmitter},
     parser::Parser,
+    prune::prune_nodes,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn bash(src: &str) -> String {
-    BashEmitter::new("bash").render(&Parser::new(src).parse().unwrap())
+    let ast = prune_nodes(Parser::new(src).parse().unwrap(), "bash");
+    BashEmitter::new("bash").render(&ast)
 }
 fn zsh(src: &str) -> String {
-    BashEmitter::new("zsh").render(&Parser::new(src).parse().unwrap())
+    let ast = prune_nodes(Parser::new(src).parse().unwrap(), "zsh");
+    BashEmitter::new("zsh").render(&ast)
 }
 fn fish(src: &str) -> String {
-    FishEmitter.render(&Parser::new(src).parse().unwrap())
+    let ast = prune_nodes(Parser::new(src).parse().unwrap(), "fish");
+    FishEmitter.render(&ast)
 }
 fn pwsh(src: &str) -> String {
-    PwshEmitter.render(&Parser::new(src).parse().unwrap())
+    let ast = prune_nodes(Parser::new(src).parse().unwrap(), "pwsh");
+    PwshEmitter.render(&ast)
 }
 
-// ── set / path / inject across all shells ────────────────────────────────────
+// ── set / path / call across all shells ────────────────────────────────────
 
 /// set emits the correct shell-specific export for each target.
 #[test]
@@ -55,23 +60,23 @@ fn path_prepend_and_append() {
     );
 }
 
-/// inject replaces {shell} with the actual shell name.
+/// call replaces {shell} with the actual shell name.
 #[test]
-fn inject_shell_placeholder() {
+fn call_shell_placeholder() {
     assert_eq!(
-        bash("inject starship init {shell}"),
+        bash("call starship init {shell}"),
         "eval \"$(starship init bash)\""
     );
     assert_eq!(
-        zsh("inject starship init {shell}"),
+        zsh("call starship init {shell}"),
         "eval \"$(starship init zsh)\""
     );
     assert_eq!(
-        fish("inject starship init {shell}"),
+        fish("call starship init {shell}"),
         "starship init fish | source"
     );
     assert_eq!(
-        pwsh("inject starship init {shell}"),
+        pwsh("call starship init {shell}"),
         "Invoke-Expression (& starship init powershell)"
     );
 }
@@ -116,15 +121,51 @@ fn if_os_with_elif() {
     assert!(p.contains("$IsWindows"), "pwsh: {}", p);
 }
 
-/// `if shell` emits a self-true / cross-false detection per backend.
+/// `if shell` — compile-time pruning applies for self-shell.
+/// When compiled for the matching shell the prune pass inlines the body;
+/// when compiled for a different shell the block is dropped entirely.
 #[test]
 fn if_shell_self_and_cross() {
-    // each shell is true for itself
-    assert!(bash("if shell bash\nset X 1\nend").contains("$BASH_VERSION"));
-    assert!(fish("if shell fish\nset X 1\nend").contains("true"));
-    assert!(pwsh("if shell pwsh\nset X 1\nend").contains("$true"));
-    // bash emitting fish-shell guard gives "false"
-    assert!(bash("if shell fish\nset X 1\nend").contains("false"));
+    // each shell compiled for itself: body is inlined, no if-wrapper remains
+    let b = bash("if shell bash\nset X 1\nend");
+    assert!(
+        b.contains("export X=\""),
+        "bash self: body not inlined: {}",
+        b
+    );
+    assert!(
+        !b.contains("if "),
+        "bash self: unexpected if-wrapper: {}",
+        b
+    );
+
+    let f = fish("if shell fish\nset X 1\nend");
+    assert!(
+        f.contains("set -gx X"),
+        "fish self: body not inlined: {}",
+        f
+    );
+    assert!(
+        !f.contains("if "),
+        "fish self: unexpected if-wrapper: {}",
+        f
+    );
+
+    let p = pwsh("if shell pwsh\nset X 1\nend");
+    assert!(p.contains("$env:X"), "pwsh self: body not inlined: {}", p);
+    assert!(
+        !p.contains("if ("),
+        "pwsh self: unexpected if-wrapper: {}",
+        p
+    );
+
+    // bash compiled for fish-shell: block is dropped (empty output)
+    let cross = bash("if shell fish\nset X 1\nend");
+    assert!(
+        cross.is_empty(),
+        "bash cross: expected empty, got: {}",
+        cross
+    );
 }
 
 /// else block is emitted correctly.
@@ -141,7 +182,7 @@ fn if_else_structure() {
 
 // ── multi-node realistic source ───────────────────────────────────────────────
 
-/// Reflects the README example: set + os guard + have guards + inject.
+/// Reflects the README example: set + os guard + have guards + call.
 /// Validates that all emitters produce the key fragments from a real-world input.
 #[test]
 fn readme_example() {
@@ -156,7 +197,7 @@ if have cargo
   path+ $HOME/.cargo/bin
 end
 if have starship
-  inject starship init {shell}
+  call starship init {shell}
 end";
 
     let b = bash(src);
@@ -248,7 +289,7 @@ fn if_and_condition_all_shells() {
     assert!(p.contains("$IsLinux"), "pwsh and rhs: {}", p);
 }
 
-/// `if os darwin or os linux` — infix `or` across all shells.
+/// `if or` — infix `or` across all shells.
 #[test]
 fn if_or_condition_all_shells() {
     let src = "if os darwin or os linux\nset POSIX 1\nend";
@@ -267,4 +308,150 @@ fn if_or_condition_all_shells() {
     assert!(p.contains("$IsMacOS"), "pwsh or lhs: {}", p);
     assert!(p.contains("-or"), "pwsh or op: {}", p);
     assert!(p.contains("$IsLinux"), "pwsh or rhs: {}", p);
+}
+
+// -- semantic pruning (shell-condition folding) ----------------------------------
+
+/// Comprehensive single-shell pruning integration test (bash).
+///
+/// Covers in one source blob: self-shell inline, foreign-shell drop,
+/// dead-head+else, dead-head+matching-elif, not-fold, and+true, and+false,
+/// or+true, and unknown guard kept as-is.
+#[test]
+fn prune_comprehensive_bash() {
+    let src = "\
+if shell bash
+  set NATIVE 1
+end
+if shell fish
+  set FISH_ONLY 1
+end
+if shell fish
+  set A fish
+else
+  set A other
+end
+if shell fish
+  set B fish
+elif shell bash
+  set B bash
+end
+if not shell fish
+  set C 1
+end
+if shell bash and have cargo
+  set D 1
+end
+if shell fish and have cargo
+  set E 1
+end
+if shell bash or have cargo
+  set F 1
+end
+if have git
+  set G 1
+end";
+    let b = bash(src);
+
+    assert!(
+        b.contains("export NATIVE=\""),
+        "(1) self-shell not inlined: {}",
+        b
+    );
+    assert!(
+        !b.contains("FISH_ONLY"),
+        "(2) dead fish block leaked: {}",
+        b
+    );
+    assert!(
+        b.contains("export A=\"other\""),
+        "(3) else not inlined: {}",
+        b
+    );
+    assert!(
+        b.contains("export B=\"bash\""),
+        "(4) matching elif not inlined: {}",
+        b
+    );
+    assert!(
+        b.contains("export C=\""),
+        "(5) not-fold: body not inlined: {}",
+        b
+    );
+    assert!(
+        b.contains("command -v cargo"),
+        "(6) and+true: have-guard missing: {}",
+        b
+    );
+    assert!(
+        b.contains("export D=\""),
+        "(6) and+true: D body missing: {}",
+        b
+    );
+    assert!(
+        !b.contains("export E"),
+        "(7) and+false: dead block leaked: {}",
+        b
+    );
+    assert!(
+        b.contains("export F=\""),
+        "(8) or+true: body not inlined: {}",
+        b
+    );
+    assert!(
+        b.contains("command -v git"),
+        "(9) unknown have-guard removed: {}",
+        b
+    );
+    assert!(
+        b.contains("export G=\""),
+        "(9) unknown: G body missing: {}",
+        b
+    );
+}
+
+/// Multi-elif chain compiled for every shell:
+/// fish/zsh/bash heads fold to the matching shell's branch;
+/// for pwsh all three fold to false and the unknown `os linux` guard
+/// is promoted to the new if-head with the original else preserved.
+#[test]
+fn prune_multi_elif_chain_all_shells() {
+    let src = "\
+if shell fish
+  set S fish
+elif shell zsh
+  set S zsh
+elif shell bash
+  set S bash
+elif os linux
+  set S linux
+else
+  set S other
+end";
+
+    let b = bash(src);
+    assert!(b.contains("export S=\"bash\""), "bash branch: {}", b);
+    assert!(!b.contains("if "), "bash: unexpected if-wrapper: {}", b);
+
+    let z = zsh(src);
+    assert!(z.contains("export S=\"zsh\""), "zsh branch: {}", z);
+    assert!(!z.contains("if "), "zsh: unexpected if-wrapper: {}", z);
+
+    let f = fish(src);
+    assert!(f.contains("set -gx S \"fish\""), "fish branch: {}", f);
+    assert!(!f.contains("if "), "fish: unexpected if-wrapper: {}", f);
+
+    // pwsh: fish/zsh/bash all dead -> os linux becomes new head
+    let p = pwsh(src);
+    assert!(p.contains("$IsLinux"), "pwsh: os guard missing: {}", p);
+    assert!(
+        p.contains("$env:S = \"linux\""),
+        "pwsh: linux body missing: {}",
+        p
+    );
+    assert!(
+        p.contains("$env:S = \"other\""),
+        "pwsh: else preserved: {}",
+        p
+    );
 }

@@ -16,13 +16,6 @@ impl ParseError {
             msg: msg.into(),
         }
     }
-    #[allow(dead_code)]
-    pub fn eof(msg: impl Into<String>) -> Self {
-        Self {
-            line: 0,
-            msg: msg.into(),
-        }
-    }
 }
 
 impl std::fmt::Display for ParseError {
@@ -38,8 +31,8 @@ impl std::fmt::Display for ParseError {
 #[derive(Debug, Clone)]
 pub enum Node {
     Set { key: String, val: String },
-    Path { dir: String, prepend: bool },  // path+ / path-
-    Inject { cmd: String, args: String }, // eval-init style (starship, zoxide…)
+    Path { dir: String, prepend: bool }, // path+ / path-
+    Call { cmd: String, args: String },  // eval-init style (starship, zoxide…)
     If(IfNode),
 }
 

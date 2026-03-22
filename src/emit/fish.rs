@@ -19,24 +19,20 @@ impl FishEmitter {
             Node::Set { key, val } => vec![self.indent(format!("set -gx {} \"{}\"", key, val), d)],
 
             // fish_add_path deduplicates automatically — no double-PATH-entry problem
-            Node::Path { dir, prepend: true } => {
-                vec![self.indent(format!("fish_add_path -gP \"{}\"", dir), d)]
+            Node::Path { dir, prepend } => {
+                let flag = if *prepend { "-gP" } else { "-gaP" };
+                vec![self.indent(format!("fish_add_path {} \"{}\"", flag, dir), d)]
             }
 
-            Node::Path {
-                dir,
-                prepend: false,
-            } => vec![self.indent(format!("fish_add_path -gaP \"{}\"", dir), d)],
-
-            Node::Inject { cmd, args } => {
-                let a = args.replace("{shell}", "fish");
+            Node::Call { cmd, args } => {
+                let a = args.replace("{shell}", self.name());
                 let a = a.trim();
-                let call = if a.is_empty() {
+                let s = if a.is_empty() {
                     format!("{} | source", cmd)
                 } else {
                     format!("{} {} | source", cmd, a)
                 };
-                vec![self.indent(call, d)]
+                vec![self.indent(s, d)]
             }
 
             Node::If(node) => self.emit_if(node, d),
@@ -76,10 +72,10 @@ impl FishEmitter {
             out.extend(self.emit_nodes(b, d + 1));
         }
         if !n.else_.is_empty() {
-            out.push(self.indent("else", d));
+            out.push(self.indent("else".into(), d));
             out.extend(self.emit_nodes(&n.else_, d + 1));
         }
-        out.push(self.indent("end", d));
+        out.push(self.indent("end".into(), d));
         out
     }
 }
@@ -123,8 +119,8 @@ mod tests {
     }
 
     #[test]
-    fn inject_with_shell_placeholder() {
-        let out = render(&[Node::Inject {
+    fn call_with_shell_placeholder() {
+        let out = render(&[Node::Call {
             cmd: "starship".into(),
             args: "init {shell}".into(),
         }]);
@@ -132,8 +128,8 @@ mod tests {
     }
 
     #[test]
-    fn inject_no_args() {
-        let out = render(&[Node::Inject {
+    fn call_no_args() {
+        let out = render(&[Node::Call {
             cmd: "myprog".into(),
             args: String::new(),
         }]);

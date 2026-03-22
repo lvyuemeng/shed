@@ -2,7 +2,7 @@ use super::Emitter;
 use crate::ast::{Cond, IfNode, Node};
 
 /// Emits POSIX-compatible sh/bash/zsh.
-/// `shell_name` is "bash" or "zsh" — used to fill {shell} in inject args.
+/// `shell_name` is "bash" or "zsh" — used to fill {shell} in call args.
 pub struct BashEmitter {
     pub shell_name: &'static str,
 }
@@ -28,24 +28,24 @@ impl BashEmitter {
         match n {
             Node::Set { key, val } => vec![self.indent(format!("export {}=\"{}\"", key, val), d)],
 
-            Node::Path { dir, prepend: true } => {
-                vec![self.indent(format!("export PATH=\"{}:$PATH\"", dir), d)]
+            Node::Path { dir, prepend } => {
+                let s = if *prepend {
+                    format!("export PATH=\"{}:$PATH\"", dir)
+                } else {
+                    format!("export PATH=\"$PATH:{}\"", dir)
+                };
+                vec![self.indent(s, d)]
             }
 
-            Node::Path {
-                dir,
-                prepend: false,
-            } => vec![self.indent(format!("export PATH=\"$PATH:{}\"", dir), d)],
-
-            Node::Inject { cmd, args } => {
-                let a = args.replace("{shell}", self.shell_name);
+            Node::Call { cmd, args } => {
+                let a = args.replace("{shell}", self.name());
                 let a = a.trim();
-                let call = if a.is_empty() {
+                let s = if a.is_empty() {
                     format!("eval \"$({})\"", cmd)
                 } else {
                     format!("eval \"$({} {})\"", cmd, a)
                 };
-                vec![self.indent(call, d)]
+                vec![self.indent(s, d)]
             }
 
             Node::If(node) => self.emit_if(node, d),
@@ -83,10 +83,10 @@ impl BashEmitter {
             out.extend(self.emit_nodes(b, d + 1));
         }
         if !n.else_.is_empty() {
-            out.push(self.indent("else", d));
+            out.push(self.indent("else".into(), d));
             out.extend(self.emit_nodes(&n.else_, d + 1));
         }
-        out.push(self.indent("fi", d));
+        out.push(self.indent("fi".into(), d));
         out
     }
 }
@@ -146,10 +146,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_with_shell_placeholder() {
+    fn call_with_shell_placeholder() {
         let out = render(
             &bash(),
-            &[Node::Inject {
+            &[Node::Call {
                 cmd: "starship".into(),
                 args: "init {shell}".into(),
             }],
@@ -158,10 +158,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_shell_placeholder_zsh() {
+    fn call_shell_placeholder_zsh() {
         let out = render(
             &zsh(),
-            &[Node::Inject {
+            &[Node::Call {
                 cmd: "starship".into(),
                 args: "init {shell}".into(),
             }],
@@ -170,10 +170,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_no_args() {
+    fn call_no_args() {
         let out = render(
             &bash(),
-            &[Node::Inject {
+            &[Node::Call {
                 cmd: "myprog".into(),
                 args: String::new(),
             }],
