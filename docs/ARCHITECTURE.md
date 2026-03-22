@@ -112,23 +112,158 @@ No associated types, no generics, no lifetime parameters on the trait.
 
 ### New shell dialect
 
-1. Add src/emit/<shell>.rs implementing Emitter.
-2. Declare `pub mod <shell>;` in src/emit.rs.
-3. Add a match arm in src/main.rs.
+1. Create `src/emit/<shell>.rs`.
+2. Declare `pub mod <shell>;` in `src/emit.rs`.
+3. Implement `Emitter` for the new struct.
+4. Add a match arm in `main.rs`.
+
+No other files need to change.
 
 ### New statement keyword
 
-1. Add a Node variant in src/ast.rs.
-2. Add a parse arm in Parser::block() in src/parser.rs.
-3. Add an emit arm in every backend node() method.
+1. Add a variant to `Node` (and `Cond` if it is a condition) in `src/ast.rs`.
+2. Add a parse arm in `Parser::block()` (or `parse_cond`) in `src/parser.rs`.
+3. Add an emit arm in every emitter's `node()` / `cond()` method.
 
 The compiler enforces exhaustiveness: no variant can be silently skipped.
 
 ### New condition type
 
-1. Add a Cond variant in src/ast.rs.
-2. Add a parse arm in Parser::parse_cond() in src/parser.rs.
-3. Add an emit arm in every backend cond() method.
+1. Add a `Cond` variant in `src/ast.rs`.
+2. Add a parse arm in `Parser::parse_cond()` in `src/parser.rs`.
+3. Add an emit arm in every backend `cond()` method.
+
+---
+
+## Module Layout
+
+```
+src/
+  main.rs       — CLI entry point only; no business logic
+  ast.rs        — data types (Node, IfNode, Cond, ParseError)
+  parser.rs     — source → AST
+  emit.rs       — Emitter trait + sub-module declarations
+  emit/
+    bash.rs     — bash / zsh backend
+    fish.rs     — fish backend
+    pwsh.rs     — PowerShell backend
+```
+
+Do not let `main.rs` grow. If logic is needed beyond dispatching to an emitter,
+it belongs in a dedicated module.
+
+---
+
+## Proposal: Compound Conditions (`and`, `or`, `not`)
+
+This section records the design rationale so future contributors can evaluate
+the trade-offs before implementing.
+
+### Motivation
+
+The current `Cond` is a single predicate: `have <cmd>`, `os <name>`,
+`shell <name>`. Users who need "cargo is installed **and** OS is Linux" today
+must nest two `if` blocks, which is verbose and produces deeper emitted code.
+
+### Design goal
+
+Allow compound conditions in the shed DSL while keeping the parser line-oriented
+and the AST flat. The syntax should look natural and not require parentheses,
+quoting, or character-level scanning.
+
+### Proposed syntax
+
+```sh
+# prefix `not` — negate a single condition
+if not have cargo
+  set CARGO_ABSENT 1
+end
+
+# infix `and` / `or` — combine exactly two conditions on one line
+if have cargo and os linux
+  path+ ~/.cargo/bin
+end
+
+if os darwin or os linux
+  set POSIX 1
+end
+```
+
+Rules:
+- `not` is a prefix modifier: `not <cond-type> <value>`.
+- `and` / `or` split the token list at the keyword: left-cond `and`/`or` right-cond.
+- Precedence is left-to-right; there are **no parentheses**. Compound chains
+  beyond two conditions are deliberately not supported in v1 — use nested `if`.
+- All tokens remain on a single line so the parser needs no new lookahead.
+
+### AST changes (`src/ast.rs`)
+
+```rust
+pub enum Cond {
+    Have(String),
+    Os(String),
+    Shell(String),
+    // New:
+    Not(Box<Cond>),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
+}
+```
+
+`Box` is justified here because `Cond` is recursive — not because we want
+indirection.
+
+### Parser changes (`src/parser.rs`)
+
+`parse_cond(ln, toks)` is the only function that needs to change.
+
+```
+toks = ["not", "have", "cargo"]           → Not(Have("cargo"))
+toks = ["have", "cargo", "and", "os", "linux"] → And(Have("cargo"), Os("linux"))
+toks = ["os", "darwin", "or", "os", "linux"]   → Or(Os("darwin"), Os("linux"))
+```
+
+Algorithm (no backtracking, one pass):
+1. If `toks[0] == "not"`, recurse on `toks[1..]` → `Cond::Not(_)`.
+2. Scan `toks` for `"and"` or `"or"` at positions 2+ (a leaf cond is at least
+   two tokens wide). Split at the first match.
+3. If no combinator found, parse as a leaf cond (current logic).
+
+### Emitter changes
+
+Each emitter's `cond()` method gains arms for `Not`, `And`, `Or`:
+
+| Shell | `Not(c)` | `And(a, b)` | `Or(a, b)` |
+|-------|----------|-------------|------------|
+| bash/zsh | `! <c>` | `<a> && <b>` | `<a> \|\| <b>` |
+| fish | `not <c>` | `<a>; and <b>` | `<a>; or <b>` |
+| pwsh | `(-not (<c>))` | `(<a>) -and (<b>)` | `(<a>) -or (<b>)` |
+
+For bash the `cond()` result is embedded in `[ … ]`; compound conditions need
+the brackets dropped and replaced with `[[ … ]]` or `if cmd1 && cmd2`. The
+cleanest approach: emit the cond string raw and let `emit_if` decide the
+wrapping based on whether the cond contains `&&` / `||`. Alternatively,
+add a `Emitter::cond_raw(&self, c: &Cond) -> String` that returns an
+unwrapped expression, and keep bracket-wrapping in `emit_if` only for leaf
+conds.
+
+### What to avoid
+
+- **Operator precedence** — do not implement it; require explicit nesting instead.
+- **Parentheses in the DSL** — the parser is line/token-split; a paren grammar
+  would need a character scanner.
+- **Deep recursion** — limit compound depth to one level in v1. Nesting beyond
+  that can use nested `if` blocks, which already work.
+
+### Implementation order
+
+1. Extend `Cond` in `ast.rs`.
+2. Update `parse_cond` in `parser.rs`.
+3. Update every emitter's `cond()` — the compiler enforces exhaustiveness.
+4. Add unit tests in each emitter for the new arms.
+5. Add integration tests in `src/tests.rs` (`and`, `or`, `not` across all shells).
+
+No other files need to change.
 
 ---
 

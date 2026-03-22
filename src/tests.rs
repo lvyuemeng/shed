@@ -207,3 +207,64 @@ fn parse_errors_carry_line_and_context() {
         .unwrap_err();
     assert_eq!(err.line, 2, "should point to if line: {}", err);
 }
+
+// ── compound conditions (not / and / or) ─────────────────────────────────────
+
+/// `if not have` — prefix negation across all shells.
+#[test]
+fn if_not_have_all_shells() {
+    let src = "if not have cargo\nset CARGO_ABSENT 1\nend";
+
+    let b = bash(src);
+    assert!(b.contains("! command -v cargo"), "bash: {}", b);
+    assert!(b.contains("fi"), "bash: {}", b);
+
+    let f = fish(src);
+    assert!(f.contains("not type -q cargo"), "fish: {}", f);
+    assert!(f.contains("end"), "fish: {}", f);
+
+    let p = pwsh(src);
+    assert!(p.contains("-not (Get-Command cargo"), "pwsh: {}", p);
+}
+
+/// `if have X and os Y` — infix `and` across all shells.
+#[test]
+fn if_and_condition_all_shells() {
+    let src = "if have cargo and os linux\npath+ $HOME/.cargo/bin\nend";
+
+    let b = bash(src);
+    assert!(b.contains("command -v cargo"), "bash and lhs: {}", b);
+    assert!(b.contains("&&"), "bash and op: {}", b);
+    assert!(b.contains("Linux"), "bash and rhs: {}", b);
+
+    let f = fish(src);
+    assert!(f.contains("type -q cargo"), "fish and lhs: {}", f);
+    assert!(f.contains("; and "), "fish and op: {}", f);
+    assert!(f.contains("Linux"), "fish and rhs: {}", f);
+
+    let p = pwsh(src);
+    assert!(p.contains("Get-Command cargo"), "pwsh and lhs: {}", p);
+    assert!(p.contains("-and"), "pwsh and op: {}", p);
+    assert!(p.contains("$IsLinux"), "pwsh and rhs: {}", p);
+}
+
+/// `if os darwin or os linux` — infix `or` across all shells.
+#[test]
+fn if_or_condition_all_shells() {
+    let src = "if os darwin or os linux\nset POSIX 1\nend";
+
+    let b = bash(src);
+    assert!(b.contains("Darwin"), "bash or lhs: {}", b);
+    assert!(b.contains("||"), "bash or op: {}", b);
+    assert!(b.contains("Linux"), "bash or rhs: {}", b);
+
+    let f = fish(src);
+    assert!(f.contains("Darwin"), "fish or lhs: {}", f);
+    assert!(f.contains("; or "), "fish or op: {}", f);
+    assert!(f.contains("Linux"), "fish or rhs: {}", f);
+
+    let p = pwsh(src);
+    assert!(p.contains("$IsMacOS"), "pwsh or lhs: {}", p);
+    assert!(p.contains("-or"), "pwsh or op: {}", p);
+    assert!(p.contains("$IsLinux"), "pwsh or rhs: {}", p);
+}

@@ -53,7 +53,10 @@ pub struct IfNode {
 
 #[derive(Debug, Clone)]
 pub enum Cond {
-    Have(String),  // if have <cmd>
-    Os(String),    // if os   darwin | linux | windows
-    Shell(String), // if shell bash | zsh | fish | pwsh
+    Have(String),              // if have <cmd>
+    Os(String),                // if os   darwin | linux | windows
+    Shell(String),             // if shell bash | zsh | fish | pwsh
+    Not(Box<Cond>),            // if not <cond>
+    And(Box<Cond>, Box<Cond>), // if <cond> and <cond>
+    Or(Box<Cond>, Box<Cond>),  // if <cond> or <cond>
 }

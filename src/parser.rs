@@ -31,37 +31,29 @@ impl Parser {
 
     // ── internal ────────────────────────────────────────────────────────────
 
-    /// Return `(line_number, keyword, full_token_slice)` for the current line
-    /// without advancing.
+    /// Return `(line_number, token_slice)` for the current line without advancing.
     fn peek(&self) -> Option<(usize, &[String])> {
         self.lines.get(self.pos).map(|(ln, t)| (*ln, t.as_slice()))
     }
 
     fn block(&mut self, stops: &[&str]) -> Result<Vec<Node>, ParseError> {
         let mut nodes = Vec::new();
-        loop {
-            match self.peek() {
-                None => break,
-                Some((_, t)) => {
-                    // `.first()` is always `Some` here — `lines` never stores
-                    // empty token vecs (the filter_map above guarantees this).
-                    if stops.contains(&t[0].as_str()) {
-                        break;
-                    }
-                }
+        // filter_map in new() guarantees every stored line has >=1 token,
+        // so t[0] is always safe to index inside the loop body.
+        while let Some((_, t)) = self.peek() {
+            if stops.contains(&t[0].as_str()) {
+                break;
             }
-            let node = self.parse_statement()?;
-            nodes.push(node);
+            nodes.push(self.parse_statement()?);
         }
         Ok(nodes)
     }
 
     fn parse_statement(&mut self) -> Result<Node, ParseError> {
-        // SAFETY: parse_statement is only called after peek() confirms a line
-        // exists at self.pos, so the index is always valid.
+        // SAFETY: only called after peek() confirms a line exists at self.pos.
         let (ln, toks) = &self.lines[self.pos];
         let ln = *ln;
-        // SAFETY: filter_map in new() guarantees every stored line has ≥1 token.
+        // SAFETY: filter_map in new() guarantees every stored line has >=1 token.
         match toks[0].as_str() {
             "set" => {
                 let key = toks
@@ -75,43 +67,38 @@ impl Parser {
                 self.pos += 1;
                 Ok(Node::Set { key, val })
             }
-            "path+" => {
+            kw @ ("path+" | "path-") => {
+                let prepend = kw == "path+";
+                let usage = if prepend {
+                    "usage: path+ DIR"
+                } else {
+                    "usage: path- DIR"
+                };
                 let dir = toks
                     .get(1)
-                    .ok_or_else(|| ParseError::at(ln, "usage: path+ DIR"))?
+                    .ok_or_else(|| ParseError::at(ln, usage))?
                     .clone();
                 self.pos += 1;
-                Ok(Node::Path { dir, prepend: true })
-            }
-            "path-" => {
-                let dir = toks
-                    .get(1)
-                    .ok_or_else(|| ParseError::at(ln, "usage: path- DIR"))?
-                    .clone();
-                self.pos += 1;
-                Ok(Node::Path {
-                    dir,
-                    prepend: false,
-                })
+                Ok(Node::Path { dir, prepend })
             }
             "inject" => {
                 let cmd = toks
                     .get(1)
                     .ok_or_else(|| ParseError::at(ln, "usage: inject CMD [ARGS]"))?
                     .clone();
-                let args = if toks.len() > 2 {
-                    toks[2..].join(" ")
-                } else {
-                    String::new()
-                };
+                let args = toks
+                    .get(2..)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.join(" "))
+                    .unwrap_or_default();
                 self.pos += 1;
                 Ok(Node::Inject { cmd, args })
             }
             "if" => {
-                // Borrow cond slice without allocating — parse_cond takes &[String].
+                // toks[1..] is the condition token list; must be non-empty.
                 let cond_slice = toks
                     .get(1..)
-                    .filter(|s| s.len() >= 2)
+                    .filter(|s| !s.is_empty())
                     .ok_or_else(|| ParseError::at(ln, "usage: if <cond-type> <value>"))?;
                 let cond = Self::parse_cond(ln, cond_slice)?;
                 self.pos += 1;
@@ -122,6 +109,32 @@ impl Parser {
     }
 
     fn parse_cond(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
+        // prefix `not` -- negate a single condition
+        if toks.first().map(|s| s.as_str()) == Some("not") {
+            let rest = toks
+                .get(1..)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ParseError::at(ln, "not requires a condition"))?;
+            return Ok(Cond::Not(Box::new(Self::parse_cond(ln, rest)?)));
+        }
+
+        // infix `and` / `or` -- scan from position 2 (a leaf cond is >=2 tokens)
+        if let Some(op_pos) = toks
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find_map(|(i, t)| (t == "and" || t == "or").then_some(i))
+        {
+            let left = Self::parse_cond(ln, &toks[..op_pos])?;
+            let right = Self::parse_cond(ln, &toks[op_pos + 1..])?;
+            return Ok(if toks[op_pos] == "and" {
+                Cond::And(Box::new(left), Box::new(right))
+            } else {
+                Cond::Or(Box::new(left), Box::new(right))
+            });
+        }
+
+        // leaf cond: <type> <value>
         let kind = toks
             .first()
             .ok_or_else(|| ParseError::at(ln, "condition requires a type"))?;
@@ -135,7 +148,7 @@ impl Parser {
             "shell" => Ok(Cond::Shell(val)),
             other => Err(ParseError::at(
                 ln,
-                format!("unknown condition {:?} — use: have | os | shell", other),
+                format!("unknown condition {:?} -- use: have | os | shell", other),
             )),
         }
     }
@@ -149,16 +162,17 @@ impl Parser {
         };
 
         // Flat while-let: consume elif*/else?/end without deep nesting.
+        // `terminated` tracks whether `end` was consumed; missing closer is caught below.
+        let mut terminated = false;
         while let Some((ln, kw)) = self.peek().map(|(ln, t)| (ln, t[0].clone())) {
             match kw.as_str() {
                 "elif" => {
-                    // Borrow cond tokens directly from the stored line; no clone needed.
-                    // SAFETY: self.pos is valid — peek() returned Some above.
+                    // SAFETY: self.pos is valid -- peek() returned Some above.
                     let cond = {
                         let toks = &self.lines[self.pos].1;
                         let cond_slice = toks
                             .get(1..)
-                            .filter(|s| s.len() >= 2)
+                            .filter(|s| !s.is_empty())
                             .ok_or_else(|| ParseError::at(ln, "elif requires a condition"))?;
                         Self::parse_cond(ln, cond_slice)?
                     };
@@ -172,6 +186,7 @@ impl Parser {
                 }
                 "end" => {
                     self.pos += 1;
+                    terminated = true;
                     break;
                 }
                 kw => {
@@ -183,14 +198,7 @@ impl Parser {
             }
         }
 
-        // If the while exited without consuming "end" the block is unterminated.
-        if self
-            .lines
-            .get(self.pos.saturating_sub(1))
-            .map(|(_, t)| t[0].as_str() != "end")
-            .unwrap_or(true)
-            && self.peek().is_none()
-        {
+        if !terminated {
             return Err(ParseError::at(
                 if_ln,
                 "unterminated if-block (missing 'end')",

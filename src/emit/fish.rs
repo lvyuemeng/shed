@@ -62,6 +62,9 @@ impl FishEmitter {
                     "false".into()
                 }
             }
+            Cond::Not(inner) => format!("not {}", self.cond(inner)),
+            Cond::And(lhs, rhs) => format!("{}; and {}", self.cond(lhs), self.cond(rhs)),
+            Cond::Or(lhs, rhs) => format!("{}; or {}", self.cond(lhs), self.cond(rhs)),
         }
     }
 
@@ -227,6 +230,36 @@ mod tests {
             out.lines().any(|l| l.starts_with("  set -gx")),
             "body not indented: {}",
             out
+        );
+    }
+
+    #[test]
+    fn cond_not() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::Not(Box::new(Cond::Have("git".into())))),
+            "not type -q git"
+        );
+    }
+
+    #[test]
+    fn cond_and() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::And(
+                Box::new(Cond::Have("cargo".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "type -q cargo; and test (uname -s) = \"Linux\""
+        );
+    }
+
+    #[test]
+    fn cond_or() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::Or(
+                Box::new(Cond::Os("darwin".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "test (uname -s) = \"Darwin\"; or test (uname -s) = \"Linux\""
         );
     }
 }

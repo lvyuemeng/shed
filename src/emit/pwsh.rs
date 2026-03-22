@@ -58,6 +58,9 @@ impl PwshEmitter {
                     "$false".into()
                 }
             }
+            Cond::Not(inner) => format!("(-not ({}))", self.cond(inner)),
+            Cond::And(lhs, rhs) => format!("({}) -and ({})", self.cond(lhs), self.cond(rhs)),
+            Cond::Or(lhs, rhs) => format!("({}) -or ({})", self.cond(lhs), self.cond(rhs)),
         }
     }
 
@@ -222,6 +225,36 @@ mod tests {
             out.lines().any(|l| l.starts_with("  $env:")),
             "body not indented: {}",
             out
+        );
+    }
+
+    #[test]
+    fn cond_not() {
+        assert_eq!(
+            PwshEmitter.cond(&Cond::Not(Box::new(Cond::Have("git".into())))),
+            "(-not (Get-Command git -ErrorAction SilentlyContinue))"
+        );
+    }
+
+    #[test]
+    fn cond_and() {
+        assert_eq!(
+            PwshEmitter.cond(&Cond::And(
+                Box::new(Cond::Have("cargo".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "(Get-Command cargo -ErrorAction SilentlyContinue) -and ($IsLinux)"
+        );
+    }
+
+    #[test]
+    fn cond_or() {
+        assert_eq!(
+            PwshEmitter.cond(&Cond::Or(
+                Box::new(Cond::Os("darwin".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "($IsMacOS) -or ($IsLinux)"
         );
     }
 }

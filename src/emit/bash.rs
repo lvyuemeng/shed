@@ -69,6 +69,9 @@ impl BashEmitter {
                 "zsh" => "[ -n \"$ZSH_VERSION\" ]".into(),
                 _ => "false".into(),
             },
+            Cond::Not(inner) => format!("! {}", self.cond(inner)),
+            Cond::And(lhs, rhs) => format!("{} && {}", self.cond(lhs), self.cond(rhs)),
+            Cond::Or(lhs, rhs) => format!("{} || {}", self.cond(lhs), self.cond(rhs)),
         }
     }
 
@@ -297,6 +300,39 @@ mod tests {
             out.lines().any(|l| l.starts_with("  export")),
             "body not indented: {}",
             out
+        );
+    }
+
+    #[test]
+    fn cond_not() {
+        let e = bash();
+        assert_eq!(
+            e.cond(&Cond::Not(Box::new(Cond::Have("git".into())))),
+            "! command -v git >/dev/null 2>&1"
+        );
+    }
+
+    #[test]
+    fn cond_and() {
+        let e = bash();
+        assert_eq!(
+            e.cond(&Cond::And(
+                Box::new(Cond::Have("cargo".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "command -v cargo >/dev/null 2>&1 && [ \"$(uname -s)\" = \"Linux\" ]"
+        );
+    }
+
+    #[test]
+    fn cond_or() {
+        let e = bash();
+        assert_eq!(
+            e.cond(&Cond::Or(
+                Box::new(Cond::Os("darwin".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "[ \"$(uname -s)\" = \"Darwin\" ] || [ \"$(uname -s)\" = \"Linux\" ]"
         );
     }
 }
