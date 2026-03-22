@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Use a token with write access so the commit can be pushed
           token: ${{ secrets.GITHUB_TOKEN }}
