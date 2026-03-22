@@ -1,0 +1,11 @@
+[package]
+name        = "shed"
+version     = "0.1.0"
+edition     = "2024"
+description = "Shell Environment Declaration — compile env.shed to bash, zsh, fish, or pwsh"
+license     = "MIT"
+repository  = "https://github.com/lvyuemeng/shed"
+
+[[bin]]
+name = "shed"
+path = "src/main.rs"
