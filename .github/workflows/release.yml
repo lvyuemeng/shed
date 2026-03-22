@@ -27,11 +27,11 @@ jobs:
             binary: shed
             cross: true
 
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: shed-macos-x86_64
             binary: shed
-            cross: false
+            cross: true
 
           - os: macos-latest
             target: aarch64-apple-darwin
