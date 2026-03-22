@@ -31,7 +31,7 @@ jobs:
             target: x86_64-apple-darwin
             artifact: shed-macos-x86_64
             binary: shed
-            cross: false
+            cross: true
 
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -91,7 +91,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
           path: dist
