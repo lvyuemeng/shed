@@ -117,6 +117,44 @@ if type -q starship
 end
 ```
 
+Compiles to powershell:
+```powershell
+$env:EDITOR = "nvim"
+if ($IsMacOS) {
+  $env:BROWSER = "open"
+} elseif ($IsLinux) {
+  $env:BROWSER = "xdg-open"
+}
+if (Get-Command cargo -ErrorAction SilentlyContinue) {
+  $env:PATH = "$HOME/.cargo/bin;$env:PATH"
+}
+if (Get-Command starship -ErrorAction SilentlyContinue) {
+  Invoke-Expression (& starship init powershell)
+}
+```
+
+## path resolution
+
+`path+` and `path-` directories are resolved at compile time using these rules,
+applied in order:
+
+1. **`~` prefix** — expanded to `$HOME` (Unix) or `%USERPROFILE%` (Windows).
+   If neither variable is set the `~` is kept as-is.
+2. **Relative path** — joined onto the directory that contains the `.shed` file,
+   so the file is portable regardless of where you run `shed` from.
+   When reading from stdin there is no anchor; relative paths are emitted unchanged.
+3. **Absolute path** — passed through unchanged.
+
+No filesystem access is performed during resolution; the path does not need to exist.
+
+```sh
+# given: shed bash ~/dot/env.shed
+
+path+ ~/.cargo/bin          # → $HOME/.cargo/bin  (rule 1)
+path+ bin                   # → /home/you/dot/bin  (rule 2, relative to env.shed)
+path+ /usr/local/bin        # → /usr/local/bin      (rule 3, absolute)
+```
+
 ## chezmoi
 
 chezmoi manages exactly two things — `env.shed` and the `shed` binary:

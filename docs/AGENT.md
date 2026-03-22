@@ -30,7 +30,7 @@ measured against these three words.
 | Situation | Rule |
 |-----------|------|
 | Need argument parsing | Write it by hand — `std::env::args()` is enough |
-| Need error handling | Use `Result<T, String>` and `format!` |
+| Need error handling | Use `Result<T, ParseError>` or `Result<T, String>` as appropriate |
 | Need file I/O | `std::fs` and `std::io` |
 | Need a serialisation format | Reconsider the design first |
 | Genuinely need an external crate | Open a discussion; the bar is very high |
@@ -39,13 +39,133 @@ measured against these three words.
 
 ## Error Handling
 
-- Return `Result<T, String>` for fallible operations.
-- Errors are plain English sentences, lowercase, no trailing period.
+### Error type
+
+Parser errors carry structured data. Use `ParseError` — a plain struct, no
+external crate, no trait magic:
+
+```rust
+// in src/ast.rs (or a separate src/error.rs if the type list grows)
+pub struct ParseError {
+    pub line: usize,   // 1-based source line; 0 means EOF / not applicable
+    pub msg:  String,  // plain English, lowercase, no trailing period
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if self.line == 0 {
+            write!(f, "{}", self.msg)
+        } else {
+            write!(f, "line {}: {}", self.line, self.msg)
+        }
+    }
+}
+```
+
+- `ParseError` is the only custom error struct in the codebase. Everything else
+  uses `Result<T, String>` with `format!`.
+- The `msg` field is plain English, lowercase, no trailing period.
   Example: `"unterminated if-block (missing 'end')"` — not `"Error: Unterminated."`
-- Errors are reported with `eprintln!("shed: {}", e)` and `process::exit(1)` in
-  `main`. No panics outside of internal logic bugs.
-- Do **not** introduce `anyhow`, `thiserror`, or custom error enums unless the
-  error type must carry structured data that a `String` genuinely cannot express.
+- Errors are reported in `main` with `eprintln!("shed: {}", e)` and
+  `process::exit(1)`. No panics outside of internal logic bugs.
+- Do **not** introduce `anyhow`, `thiserror`, or additional error enums unless
+  the type must carry structured data that `ParseError` genuinely cannot express.
+
+---
+
+## Safety Rules
+
+These rules prevent panics on bad user input.
+
+### No direct indexing without a proven bounds check
+
+```rust
+// Bad — panics on an empty token list
+let kw = toks[0].as_str();
+
+// Good — propagate gracefully
+let kw = toks.first()
+    .ok_or_else(|| ParseError { line, msg: "empty line".into() })?;
+```
+
+Use `.get(i)`, `.first()`, `.last()`, or a preceding `match` / `if let`
+instead of `collection[i]` when the index is not provably in-bounds from the
+same expression's context. If a check was done one or two lines above, add a
+short comment explaining why the index is safe.
+
+### No `unwrap()` or `expect()` on user-input paths
+
+`unwrap()` / `expect()` are acceptable **only** in:
+
+- test code,
+- provably infallible paths — add a comment explaining why.
+
+Everywhere else, propagate with `?` or convert with `.ok_or_else(...)`.
+
+### Prefer `Cow<'_, str>` for zero-copy strings
+
+When a function either returns a borrowed slice unchanged **or** allocates a
+modified copy, prefer `std::borrow::Cow<'_, str>` over always allocating a new
+`String`. The `indent()` helper in `Emitter` is the canonical example: at
+depth 0 it returns the input untouched; only at depth > 0 does it allocate.
+
+---
+
+## Code Style
+
+### Prefer shallow nesting — two levels maximum per function
+
+Deep nesting hides control flow and makes errors hard to locate. Target at most
+two levels of indented blocks per function body.
+
+```rust
+// Bad — three levels before the real work
+loop {
+    match peek() {
+        Some(kw) => {
+            match kw {
+                "elif" => { ... }
+            }
+        }
+    }
+}
+
+// Good — flat while-let, single match level
+while let Some((ln, kw)) = self.peek_kw() {
+    match kw.as_str() {
+        "elif" => { ... }
+        "end"  => { self.pos += 1; break; }
+        kw     => return Err(ParseError { line: ln, msg: format!("unexpected {:?}", kw) }),
+    }
+}
+```
+
+Extract sub-logic into a named helper rather than adding a third nesting level.
+
+### Prefer data-pipeline / iterator style over imperative loops
+
+When a transformation maps a collection to another collection, prefer an
+iterator chain. Reserve `for` loops for cases where mutation or early-exit
+cannot be expressed clearly as a chain.
+
+```rust
+// Acceptable but verbose
+let mut out = Vec::new();
+for n in nodes {
+    out.push(transform(n));
+}
+
+// Preferred
+let out: Vec<_> = nodes.into_iter().map(transform).collect();
+```
+
+Iterator chains compose naturally with `flat_map`, `filter_map`, and `chain`.
+
+### Match exhaustively; avoid silent catch-all arms
+
+A `_ => {}` arm on a closed enum silences compiler warnings when a new variant
+is added. Match every known variant explicitly, or use
+`_ => unreachable!("...")` with a comment if an arm is structurally impossible.
 
 ---
 
@@ -66,10 +186,14 @@ measured against these three words.
 - The parser is a **line-oriented, token-split** recursive-descent parser.
   Each line is split on whitespace before parsing begins; there is no character-
   level scanner.
+- `Parser` stores `Vec<(usize, Vec<String>)>` — the `usize` is the 1-based
+  original source line number, preserved through blank-line and comment
+  filtering so every error message is actionable.
 - `Parser::block()` is the central loop. It consumes lines until it hits a stop
   keyword or EOF.
-- Error messages must include enough context for the user to fix the problem
-  without reading source code.
+- Error messages must include a line number and enough context for the user to
+  fix the problem without reading source code. Return `ParseError`, not a bare
+  `String`.
 - Do **not** add backtracking, lookahead beyond `peek()`, or any form of
   speculative parse.
 
@@ -87,30 +211,11 @@ measured against these three words.
 
 ---
 
-## Module Layout
-
-```
-src/
-  main.rs       — CLI entry point only; no business logic
-  ast.rs        — data types (Node, IfNode, Cond)
-  parser.rs     — source → AST
-  emit.rs       — Emitter trait + sub-module declarations
-  emit/
-    bash.rs     — bash / zsh backend
-    fish.rs     — fish backend
-    pwsh.rs     — PowerShell backend
-```
-
-Do not let `main.rs` grow. If logic is needed beyond dispatching to an emitter,
-it belongs in a dedicated module.
-
----
-
 ## Naming Conventions
 
 | What | Convention | Example |
 |------|------------|---------|
-| Types / traits | `UpperCamelCase` | `BashEmitter`, `IfNode` |
+| Types / traits | `UpperCamelCase` | `BashEmitter`, `IfNode`, `ParseError` |
 | Functions / methods | `snake_case` | `emit_nodes`, `parse_cond` |
 | Local variables | `snake_case`, short | `d` for depth, `t` for token-line |
 | Constants | `SCREAMING_SNAKE` | `USAGE` |
@@ -134,25 +239,6 @@ Single-letter variables are acceptable **only** inside tight, obvious loops
 
 ---
 
-## Adding a Shell
-
-1. Create `src/emit/<shell>.rs`.
-2. Declare `pub mod <shell>;` in `src/emit.rs`.
-3. Implement `Emitter` for the new struct.
-4. Add a match arm in `main.rs`.
-
-No other files need to change.
-
-## Adding a Keyword
-
-1. Add a variant to `Node` (and `Cond` if it is a condition) in `src/ast.rs`.
-2. Add a parse arm in `Parser::block()` (or `parse_cond`) in `src/parser.rs`.
-3. Add an emit arm in every emitter's `node()` / `cond()` method.
-
-The compiler will point out every missing arm.
-
----
-
 ## What to Avoid
 
 - **Macros** for things that a function or a match arm handles cleanly.
@@ -162,3 +248,9 @@ The compiler will point out every missing arm.
   or more places.
 - **Configuration structs** for single-value options — pass the value directly.
 - **`unwrap()` / `expect()`** in paths that can be reached by bad user input.
+- **Direct indexing** (`slice[i]`) without a preceding bounds check or a
+  comment proving the index is safe.
+- **Bare `String` errors from the parser** — use `ParseError` so callers have
+  the line number without re-parsing the message.
+- **Deep nesting** — more than two levels of indented blocks in a single
+  function body. Extract a helper instead.
