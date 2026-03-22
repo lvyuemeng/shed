@@ -19,31 +19,26 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact: shed-linux-x86_64
             binary: shed
-            cross: false
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             artifact: shed-linux-aarch64
             binary: shed
-            cross: true
 
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: shed-macos-x86_64
             binary: shed
-            cross: true
 
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: shed-macos-aarch64
             binary: shed
-            cross: false
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: shed-windows-x86_64.exe
             binary: shed.exe
-            cross: false
 
     runs-on: ${{ matrix.os }}
 
@@ -55,20 +50,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl-tools
-        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+      - name: Install musl-tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install cross
-        if: ${{ matrix.cross }}
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install cross-linker (aarch64-linux-musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build (cross)
-        if: ${{ matrix.cross }}
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
