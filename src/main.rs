@@ -61,6 +61,8 @@ DSL REFERENCE
   if not have cargo and os linux parsed as: (not have cargo) and (os linux)
 ";
 
+/// Read source from `path` (a file) or from stdin when `path` is `None`.
+/// Errors include the path in the message so the caller can surface it directly.
 fn read(path: Option<&str>) -> Result<String, String> {
     match path {
         Some(p) => fs::read_to_string(p).map_err(|e| format!("{}: {}", p, e)),
@@ -74,70 +76,9 @@ fn read(path: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// Resolve a path token from a shed source file.
-///
-/// Rules (applied in order):
-/// 1. `~` prefix  → replace with `$HOME` (Unix) / `$USERPROFILE` (Windows).
-///    If neither var is set the `~` is left as-is rather than silently
-///    producing a wrong path.
-/// 2. Relative path → join onto `base` (the directory of the shed file).
-///    When reading from stdin `base` is `None`; relative paths are kept as-is
-///    because there is no meaningful anchor.
-/// 3. Absolute path → returned unchanged.
-///
-/// No I/O is performed; the path need not exist.
-fn resolve_path(dir: &str, base: Option<&Path>) -> String {
-    // Step 1 — home-dir expansion.
-    let expanded: PathBuf = if let Some(rest) = dir.strip_prefix('~') {
-        let home = env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .unwrap_or_default();
-        if home.is_empty() {
-            // Cannot expand; return as-is.
-            return dir.to_owned();
-        }
-        // rest starts with '/' on Unix or is empty for bare '~'.
-        PathBuf::from(home).join(rest.trim_start_matches('/'))
-    } else {
-        PathBuf::from(dir)
-    };
-
-    // Step 2 — resolve relative paths against the shed file's directory.
-    if expanded.is_relative() {
-        base.map(|b| b.join(&expanded))
-            .unwrap_or(expanded)
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        expanded.to_string_lossy().into_owned()
-    }
-}
-
-/// Walk the AST and resolve every `Node::Path` directory in place.
-/// All other node types are passed through unchanged.
-fn resolve_paths(nodes: Vec<Node>, base: Option<&Path>) -> Vec<Node> {
-    nodes
-        .into_iter()
-        .map(|n| match n {
-            Node::Path { dir, prepend } => Node::Path {
-                dir: resolve_path(&dir, base),
-                prepend,
-            },
-            Node::If(mut inode) => {
-                inode.body = resolve_paths(inode.body, base);
-                inode.elifs = inode
-                    .elifs
-                    .into_iter()
-                    .map(|(c, b)| (c, resolve_paths(b, base)))
-                    .collect();
-                inode.else_ = resolve_paths(inode.else_, base);
-                Node::If(inode)
-            }
-            other => other,
-        })
-        .collect()
-}
-
+/// Return the directory of the shed source file as an absolute path,
+/// resolving it against the current working directory when necessary.
+/// Returns `None` when reading from stdin (no anchor directory).
 fn base_dir(file: Option<&str>) -> Option<PathBuf> {
     let parent = Path::new(file?).parent()?;
     Some(
@@ -147,6 +88,8 @@ fn base_dir(file: Option<&str>) -> Option<PathBuf> {
     )
 }
 
+/// Render `ast` to a shell-specific string for the named `shell`.
+/// Returns an error for unknown shell names.
 fn emit(shell: &str, ast: &[Node]) -> Result<String, String> {
     match shell {
         "bash" => Ok(BashEmitter::new("bash").render(ast)),
@@ -160,6 +103,8 @@ fn emit(shell: &str, ast: &[Node]) -> Result<String, String> {
     }
 }
 
+/// Top-level entry point: parses `args`, reads the source, and either
+/// runs the `check` subcommand or compiles and prints the target shell output.
 fn run(args: &[String]) -> Result<(), String> {
     // --help / -h anywhere in the args, or bare invocation with no subcommand,
     // prints usage to stdout and exits cleanly (exit 0).
@@ -172,10 +117,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let file = args.get(2).map(String::as_str);
     let base = base_dir(file);
 
-    // For `check` we skip pruning so the node count reflects the raw parse.
+    // Parse and resolve paths in one step: Parser::new takes the base dir so
+    // `path+` / `path-` tokens are normalised during parsing — no separate pass.
     let parsed = read(file)
-        .and_then(|src| Parser::new(&src).parse().map_err(|e| e.to_string()))
-        .map(|nodes| resolve_paths(nodes, base.as_deref()))?;
+        .and_then(|src| Parser::new(&src, base).parse().map_err(|e| e.to_string()))?;
 
     if shell == "check" {
         println!("ok ({} top-level nodes)", parsed.len());

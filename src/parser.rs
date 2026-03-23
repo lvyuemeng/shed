@@ -1,28 +1,114 @@
-use crate::ast::{Cond, IfNode, Node, ParseError};
+use std::{
+    borrow::Cow,
+    env,
+    path::{Path, PathBuf},
+};
+
+use crate::ast::{Cond, IfNode, Node, ParseError, PathDir};
 
 pub struct Parser {
     /// Each entry is `(source_line_number, tokens)`. Line numbers are 1-based
     /// and reflect the original file so error messages are actionable.
     lines: Vec<(usize, Vec<String>)>,
     pos: usize,
+    /// Anchor directory used to resolve relative `path+` / `path-` tokens.
+    /// `None` when reading from stdin (no meaningful anchor).
+    base: Option<PathBuf>,
+}
+
+/// Strip a single layer of surrounding `"…"` or `'…'` from `s`.
+/// Only acts when the *entire* token is wrapped; partial quotes are left alone.
+/// Returns a borrowed slice when no stripping is needed (zero allocation).
+fn strip_quotes(s: &str) -> Cow<'_, str> {
+    let b = s.as_bytes();
+    let quoted = b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"')
+            || (b[0] == b'\'' && b[b.len() - 1] == b'\''));
+    if quoted {
+        Cow::Owned(s[1..s.len() - 1].to_owned())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Join tokens from index `from` onward with spaces.
+/// Returns `None` when the resulting slice is empty.
+fn tail_joined(toks: &[String], from: usize) -> Option<String> {
+    let rest = toks.get(from..)?;
+    if rest.is_empty() { None } else { Some(rest.join(" ")) }
+}
+
+/// Find the rightmost position of `op` in `toks` satisfying the
+/// left-associative binary-operator constraint:
+///   - at least two tokens to the left  (`i >= 2`)
+///   - at least one token to the right  (`i + 1 < toks.len()`)
+/// The `i >= 2` requirement ensures there are enough tokens on the left
+/// for a valid leaf condition (type + value).
+fn last_op_pos(toks: &[String], op: &str) -> Option<usize> {
+    toks.iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, t)| (t == op && i >= 2 && i + 1 < toks.len()).then_some(i))
+}
+
+/// Resolve a path token from a shed source file.
+///
+/// Rules (applied in order):
+/// 1. `~` prefix → expand to `$HOME` (Unix) or `$USERPROFILE` (Windows).
+///    If neither variable is set the `~` is left as-is.
+/// 2. Relative path → join onto `base` (the shed file's directory).
+///    When `base` is `None` (stdin) relative paths are kept as-is.
+/// 3. Absolute path → returned unchanged.
+///
+/// No I/O is performed; the resolved path need not exist.
+pub fn resolve_path(raw: &str, base: Option<&Path>) -> String {
+    let expanded: PathBuf = if let Some(rest) = raw.strip_prefix('~') {
+        let home = env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .unwrap_or_default();
+        if home.is_empty() {
+            return raw.to_owned();
+        }
+        PathBuf::from(home).join(rest.trim_start_matches('/'))
+    } else {
+        PathBuf::from(raw)
+    };
+
+    if expanded.is_relative() {
+        base.map(|b| b.join(&expanded))
+            .unwrap_or(expanded)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        expanded.to_string_lossy().into_owned()
+    }
 }
 
 impl Parser {
-    pub fn new(src: &str) -> Self {
+    /// Construct a parser for `src`.
+    ///
+    /// `base` is the directory of the shed source file, used to resolve
+    /// relative and home-prefixed `path+` / `path-` tokens at parse time.
+    /// Pass `None` when reading from stdin (no anchor directory).
+    pub fn new(src: &str, base: Option<PathBuf>) -> Self {
         let lines = src
             .lines()
             .enumerate()
             .filter_map(|(i, raw)| {
+                // SAFETY: split('#') always yields at least one element.
                 let s = raw.split('#').next().unwrap_or("").trim();
                 if s.is_empty() {
                     None
                 } else {
-                    let toks = s.split_whitespace().map(String::from).collect();
+                    // Reserve a small but reasonable capacity; most lines have
+                    // 2–4 tokens so this avoids the first 1–2 realloc cycles.
+                    let mut toks = Vec::with_capacity(4);
+                    toks.extend(s.split_whitespace().map(String::from));
                     Some((i + 1, toks))
                 }
             })
             .collect();
-        Self { lines, pos: 0 }
+        Self { lines, pos: 0, base }
     }
 
     pub fn parse(&mut self) -> Result<Vec<Node>, ParseError> {
@@ -56,33 +142,34 @@ impl Parser {
         // SAFETY: filter_map in new() guarantees every stored line has >=1 token.
         match toks[0].as_str() {
             "set" => {
-                if toks.len() < 3 {
-                    return Err(ParseError::at(ln, "usage: set KEY VALUE"));
-                }
-                let key = toks[1].clone();
-                let val = toks[2..].join(" ");
+                // Need at least: set KEY VALUE  (3 tokens).
+                let key = toks
+                    .get(1)
+                    .ok_or_else(|| ParseError::at(ln, "usage: set KEY VALUE"))?
+                    .clone();
+                let val = tail_joined(toks, 2)
+                    .ok_or_else(|| ParseError::at(ln, "usage: set KEY VALUE"))?;
                 self.pos += 1;
                 Ok(Node::Set { key, val })
             }
             kw @ ("path+" | "path-") => {
-                let prepend = kw == "path+";
-                let dir = toks
+                let direction = if kw == "path+" { PathDir::Prepend } else { PathDir::Append };
+                let raw = toks
                     .get(1)
-                    .ok_or_else(|| ParseError::at(ln, format!("usage: {} DIR", kw)))?
-                    .clone();
+                    .ok_or_else(|| ParseError::at(ln, format!("usage: {} DIR", kw)))
+                    .map(|s| strip_quotes(s).into_owned())?;
+                // Resolve home-dir expansion and relative paths at parse time
+                // so the rest of the pipeline (prune, emit) works with final paths.
+                let dir = resolve_path(&raw, self.base.as_deref());
                 self.pos += 1;
-                Ok(Node::Path { dir, prepend })
+                Ok(Node::Path { dir, direction })
             }
             "call" => {
                 let cmd = toks
                     .get(1)
-                    .ok_or_else(|| ParseError::at(ln, "usage: call CMD [ARGS]"))?
-                    .clone();
-                let args = toks
-                    .get(2..)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.join(" "))
-                    .unwrap_or_default();
+                    .ok_or_else(|| ParseError::at(ln, "usage: call CMD [ARGS]"))
+                    .map(|s| strip_quotes(s).into_owned())?;
+                let args = tail_joined(toks, 2).unwrap_or_default();
                 self.pos += 1;
                 Ok(Node::Call { cmd, args })
             }
@@ -91,10 +178,7 @@ impl Parser {
                     .get(1)
                     .ok_or_else(|| ParseError::at(ln, "usage: alias NAME BODY"))?
                     .clone();
-                let body = toks
-                    .get(2..)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.join(" "))
+                let body = tail_joined(toks, 2)
                     .ok_or_else(|| ParseError::at(ln, "usage: alias NAME BODY"))?;
                 self.pos += 1;
                 Ok(Node::Alias { name, body })
@@ -119,22 +203,15 @@ impl Parser {
 
     /// Lowest precedence: `or`. Left-associative.
     ///
-    /// Left-associativity requires splitting at the LAST `or` (rightmost
-    /// operator at this precedence level), then recursing `parse_or` on
-    /// the LEFT subtree. The right side is parsed by `parse_and`.
+    /// Splits at the LAST `or`; left subtree recurses through `parse_or`,
+    /// right side is parsed by `parse_and`.
     ///
     /// Example: `a or b or c`
-    ///   last `or` at position of second `or`
     ///   → Or(parse_or("a or b"), parse_and("c"))
-    ///   → Or(Or(a,b), c)  -- left-associative
+    ///   → Or(Or(a,b), c)  — left-associative
     fn parse_or(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
-        if let Some(op) = toks
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, t)| (t == "or" && i >= 2 && i + 1 < toks.len()).then_some(i))
-        {
-            let left = Self::parse_or(ln, &toks[..op])?;
+        if let Some(op) = last_op_pos(toks, "or") {
+            let left  = Self::parse_or(ln, &toks[..op])?;
             let right = Self::parse_and(ln, &toks[op + 1..])?;
             return Ok(Cond::Or(Box::new(left), Box::new(right)));
         }
@@ -143,21 +220,15 @@ impl Parser {
 
     /// Medium precedence: `and`. Left-associative.
     ///
-    /// Same strategy: split at the LAST `and`, recurse `parse_and` on the
-    /// left, delegate the right to `parse_not`.
+    /// Splits at the LAST `and`; left subtree recurses through `parse_and`,
+    /// right side is parsed by `parse_not`.
     ///
     /// Example: `a and b and c`
-    ///   last `and` at position of second `and`
     ///   → And(parse_and("a and b"), parse_not("c"))
-    ///   → And(And(a,b), c)  -- left-associative
+    ///   → And(And(a,b), c)  — left-associative
     fn parse_and(ln: usize, toks: &[String]) -> Result<Cond, ParseError> {
-        if let Some(op) = toks
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, t)| (t == "and" && i >= 2 && i + 1 < toks.len()).then_some(i))
-        {
-            let left = Self::parse_and(ln, &toks[..op])?;
+        if let Some(op) = last_op_pos(toks, "and") {
+            let left  = Self::parse_and(ln, &toks[..op])?;
             let right = Self::parse_not(ln, &toks[op + 1..])?;
             return Ok(Cond::And(Box::new(left), Box::new(right)));
         }
@@ -183,15 +254,20 @@ impl Parser {
             .ok_or_else(|| ParseError::at(ln, "condition requires a type"))?;
         let val = toks
             .get(1)
-            .cloned()
+            .map(|s| strip_quotes(s).into_owned())
             .ok_or_else(|| ParseError::at(ln, format!("{} requires a value", kind)))?;
         match kind.as_str() {
-            "have" => Ok(Cond::Have(val)),
-            "os" => Ok(Cond::Os(val)),
-            "shell" => Ok(Cond::Shell(val)),
-            other => Err(ParseError::at(
+            "have"   => Ok(Cond::Have(val)),
+            "exists" => Ok(Cond::Exists(val)),
+            "env"    => Ok(Cond::Env(val)),
+            "os"     => Ok(Cond::Os(val)),
+            "shell"  => Ok(Cond::Shell(val)),
+            other    => Err(ParseError::at(
                 ln,
-                format!("unknown condition {:?} -- use: have | os | shell", other),
+                format!(
+                    "unknown condition {:?} -- use: have | exists | env | os | shell",
+                    other
+                ),
             )),
         }
     }
@@ -217,15 +293,13 @@ impl Parser {
                     return Ok(node);
                 }
                 Some((ln, kw)) if kw == "elif" => {
-                    // SAFETY: peek() returned Some above.
-                    let cond = {
-                        let toks = &self.lines[self.pos].1;
-                        let cond_slice = toks
-                            .get(1..)
-                            .filter(|s| !s.is_empty())
-                            .ok_or_else(|| ParseError::at(ln, "elif requires a condition"))?;
-                        Self::parse_cond(ln, cond_slice)?
-                    };
+                    // SAFETY: peek() returned Some above; self.pos is valid.
+                    let cond_slice = self.lines[self.pos]
+                        .1
+                        .get(1..)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| ParseError::at(ln, "elif requires a condition"))?;
+                    let cond = Self::parse_cond(ln, cond_slice)?;
                     self.pos += 1;
                     let b = self.block(&["elif", "else", "end"])?;
                     node.elifs.push((cond, b));
@@ -258,7 +332,7 @@ mod tests {
     use crate::ast::{Cond, Node};
 
     fn parse(src: &str) -> Result<Vec<Node>, ParseError> {
-        Parser::new(src).parse()
+        Parser::new(src, None).parse()
     }
 
     // ── happy-path structural checks ─────────────────────────────────────────

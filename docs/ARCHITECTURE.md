@@ -58,19 +58,24 @@ The AST is deliberately flat and concrete. There is no generic expression
 node, no precedence hierarchy, no optional field hiding ambiguity.
 
     Node
-      Set    { key, val }     -- export an environment variable
-      Path   { dir, prepend } -- prepend or append to PATH
-      call { cmd, args }    -- eval-style initialiser
+      Set   { key, val }     -- export an environment variable
+      Path  { dir, prepend } -- prepend or append to PATH
+      Call  { cmd, args }    -- eval-style initialiser
+      Alias { name, body }   -- shell alias
       If(IfNode)
         cond  : Cond
-        body  : Vec     -- then-branch
-        elifs : Vec -- elif branches
-        else_ : Vec     -- empty = absent
+        body  : Vec<Node>     -- then-branch
+        elifs : Vec<(Cond, Vec<Node>)> -- elif branches
+        else_ : Vec<Node>     -- empty = absent
 
     Cond
-      Have(cmd)    -- command must exist on PATH
-      Os(name)     -- darwin | linux | windows
-      Shell(name)  -- bash | zsh | fish | pwsh
+      Have(cmd)    -- command must exist on PATH (runtime)
+      Exists(path) -- path must exist on filesystem (runtime)
+      Os(name)     -- darwin | linux | windows (compile-time fold)
+      Shell(name)  -- bash | zsh | fish | pwsh (compile-time fold)
+      Not(Cond)
+      And(Cond, Cond)
+      Or(Cond, Cond)
 
 Nesting is supported through IfNode body / elifs / else_.
 The recursive block() call handles arbitrary depth naturally.
@@ -205,7 +210,7 @@ cond     = or_expr
 or_expr  = and_expr ( "or"  and_expr )*
 and_expr = not_expr ( "and" not_expr )*
 not_expr = "not" not_expr | leaf
-leaf     = ( "have" | "os" | "shell" ) value
+leaf     = ( "have" | "exists" | "os" | "shell" ) value
 ```
 
 Because the DSL is line/token-split, each leaf occupies exactly two tokens.
@@ -240,7 +245,7 @@ parse_not(ln, toks)
   else: parse_leaf(toks)
 
 parse_leaf(ln, toks)
-  expects exactly [type, value]; type in {have, os, shell}
+  expects exactly [type, value]; type in {have, exists, os, shell}
 ```
 
 Right-to-left scanning for the LAST operator, with left-recursive descent,
@@ -266,8 +271,9 @@ achieves left-associativity:
 
 ### Implementation files
 
-All changes are confined to `src/parser.rs`. The `Cond` AST in `src/ast.rs`
-and all emitters are unchanged.
+`src/parser.rs` — condition parsing and precedence.
+`src/ast.rs` — `Cond` variants (`Have`, `Exists`, `Os`, `Shell`, `Not`, `And`, `Or`).
+All four emitter backends — each must handle every `Cond` variant.
 
 ---
 
@@ -282,7 +288,7 @@ Conditional blocks guarded by `Cond::Shell` or `Cond::Os` are statically
 known to be always-true or always-false for a specific compilation target.
 Emitting dead branches wastes output lines and can confuse shell linters.
 
-Examples (target = bash):
+Examples (target = bash on Linux):
 
 ```
 if shell fish          →  entire block unreachable; prune to nothing
@@ -293,17 +299,30 @@ if shell bash          →  guard always true; inline the body directly
   set EDITOR nvim
 end
 
-if os darwin           →  condition unknown at compile time; kept as-is
-  ...
+if os linux            →  always-true on a Linux build; inline body directly
+  set BROWSER xdg-open
+end
+
+if os darwin           →  always-false on a Linux build; drop block
+  set BROWSER open
+end
+
+if have cargo          →  runtime check; always kept as-is
+  path+ $HOME/.cargo/bin
+end
+
+if exists $HOME/.cargo/bin   →  filesystem check; always kept as-is
+  path+ $HOME/.cargo/bin
 end
 ```
 
-`Cond::Have` is a runtime check (command existence may differ per machine)
-and is never pruned.
+`Cond::Have` and `Cond::Exists` are runtime checks that may differ per
+machine and are never folded.
 
-`Cond::Os` is known only when the shed file is compiled for a specific
-machine. Because `shed` is a source-to-source compiler targeting multiple
-hosts from one file, `os` conditions are left untouched.
+`Cond::Os` is now folded **at compile time** using Rust's `#[cfg(target_os)]`.
+For the three known names (`darwin`, `linux`, `windows`) the result is
+always-true or always-false depending on the build host. Unknown OS names
+stay as runtime checks.
 
 ### Pruning rules for `Cond::Shell(name)`
 
@@ -311,6 +330,16 @@ hosts from one file, `os` conditions are left untouched.
 |-----------|-------------|--------|
 | `Shell(s)` where `s == target` | any | always-true → inline body |
 | `Shell(s)` where `s != target` | any | always-false → drop branch |
+
+### Pruning rules for `Cond::Os(name)`
+
+| Condition | Build host | Result |
+|-----------|-----------|--------|
+| `Os("linux")` | linux | always-true → inline body |
+| `Os("darwin")` | macos | always-true → inline body |
+| `Os("windows")` | windows | always-true → inline body |
+| `Os(known)` | different known OS | always-false → drop branch |
+| `Os(unknown)` | any | Unknown → runtime check emitted |
 
 ### Pruning rules for compound conditions
 
@@ -377,6 +406,89 @@ No other files need to change.
   Plugin / dynamic loading       -- shell set is closed; static dispatch wins
   Runtime configuration file     -- all behaviour driven by the .shed source
   IR between parser and emitter  -- the AST is the IR; no lowering needed
+
+---
+
+## `Cond::Exists` — Filesystem-Presence Check
+
+`if exists <path>` evaluates the path at shell startup time. It solves the
+cargo bootstrap problem cleanly: instead of checking whether `cargo` is on
+PATH (which it isn't yet), check whether the `.cargo/bin` directory already
+exists on disk.
+
+```shed
+# chicken-and-egg free:
+if exists $HOME/.cargo/bin
+  path+ $HOME/.cargo/bin
+end
+```
+
+Emitter output:
+
+| Shell | `Exists(path)` |
+|-------|----------------|
+| bash/zsh | `[ -e "path" ]` |
+| fish | `test -e "path"` |
+| pwsh | `Test-Path "path"` |
+
+Like `Have`, `Exists` is always kept as a runtime check; it is never
+statically folded.
+
+---
+
+## `Cond::Env` — Environment-Variable Presence Check
+
+`if env <VAR>` checks whether an environment variable is set and non-empty.
+This is a second option for the bootstrap problem: tools like `rustup` set
+`CARGO_HOME` on installation, so checking for that variable is an alternative
+to checking the directory.
+
+```shed
+# alternative using env var:
+if env CARGO_HOME
+  path+ $CARGO_HOME/bin
+end
+```
+
+Emitter output:
+
+| Shell | `Env(var)` |
+|-------|------------|
+| bash/zsh | `[ -n "${VAR:-}" ]` |
+| fish | `set -q VAR` |
+| pwsh | `(Test-Path env:VAR)` |
+
+Like `Have` and `Exists`, `Env` is always a runtime check; never folded.
+
+---
+
+## PATH Deduplication Guard
+
+`path+` and `path-` emit an unconditional PATH mutation today, which means
+re-sourcing the shell config appends the same directory multiple times.
+
+The emitters wrap every `Path` node with an existence-then-duplicate guard:
+
+| Shell | Guard |
+|-------|-------|
+| bash/zsh | `[[ ":$PATH:" != *":dir:"* ]] && export PATH="dir:$PATH"` |
+| fish | `fish_add_path` already deduplicates; no change needed |
+| pwsh | `if ("$env:PATH" -notlike "*;dir;*") { $env:PATH = "dir;$env:PATH" }` |
+
+---
+
+## Quote Stripping in the Parser
+
+When a user writes `path+ "$HOME/.cargo/bin"` the surrounding double-quotes
+become part of the stored token and are then emitted again, producing
+`"\"$HOME/.cargo/bin\""` (double-quoted). The parser strips a single layer of
+surrounding `"…"` or `'…'` from any single-token value.
+
+Rule: strip quotes only when the entire token is wrapped (`"foo"` → `foo`,
+`'bar'` → `bar`); leave partial quotes and multi-token values alone.
+
+Change surface: one private helper [`strip_quotes(s)`](src/parser.rs) called
+on every value token (`val`, `dir`, `cmd`, `body`, condition value).
 
 ---
 

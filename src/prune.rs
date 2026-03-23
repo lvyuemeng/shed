@@ -22,6 +22,7 @@ use crate::ast::{Cond, IfNode, Node};
 ///
 /// Non-`If` nodes pass through unchanged.
 pub fn prune_nodes(nodes: Vec<Node>, shell: &str) -> Vec<Node> {
+    // Worst case is identity (all nodes unknown); pre-size to len.
     let mut out = Vec::with_capacity(nodes.len());
     for n in nodes {
         match n {
@@ -35,6 +36,7 @@ pub fn prune_nodes(nodes: Vec<Node>, shell: &str) -> Vec<Node> {
 // -- private helpers ----------------------------------------------------------
 
 /// Outcome of statically evaluating a condition for a target shell.
+#[derive(Debug, Clone, PartialEq)]
 enum CondResult {
     AlwaysTrue,
     AlwaysFalse,
@@ -50,8 +52,14 @@ fn prune_cond(cond: Cond, shell: &str) -> CondResult {
         Cond::Shell(ref name) if name == shell => CondResult::AlwaysTrue,
         Cond::Shell(_) => CondResult::AlwaysFalse,
 
-        // Have and Os are runtime / multi-host -- never folded.
-        c @ (Cond::Have(_) | Cond::Os(_)) => CondResult::Unknown(c),
+        // Os: fold statically at compile time via #[cfg(target_os)].
+        // If the os string matches the compile-target we know it is always-true;
+        // if it is a *known* other OS string it is always-false.
+        // Unknown OS names are kept as Unknown so the runtime check fires.
+        Cond::Os(ref name) => fold_os(name),
+
+        // Have, Exists, and Env are runtime checks -- never folded.
+        c @ (Cond::Have(_) | Cond::Exists(_) | Cond::Env(_)) => CondResult::Unknown(c),
 
         Cond::Not(inner) => match prune_cond(*inner, shell) {
             CondResult::AlwaysTrue => CondResult::AlwaysFalse,
@@ -85,6 +93,35 @@ fn fold_or(l: CondResult, r: CondResult) -> CondResult {
         (CondResult::Unknown(lc), CondResult::Unknown(rc)) => {
             CondResult::Unknown(Cond::Or(Box::new(lc), Box::new(rc)))
         }
+    }
+}
+
+/// Fold `Cond::Os` at compile time using a single `#[cfg]`-chosen constant.
+///
+/// The known names are "darwin", "linux", and "windows".
+/// Any name matching the compile-time target is `AlwaysTrue`;
+/// any other *known* name is `AlwaysFalse`; unknown names stay `Unknown`
+/// (runtime check emitted).
+fn fold_os(name: &str) -> CondResult {
+    // Chosen once at compile time; at most one branch is active.
+    #[cfg(target_os = "macos")]
+    const CURRENT_OS: &str = "darwin";
+    #[cfg(target_os = "linux")]
+    const CURRENT_OS: &str = "linux";
+    #[cfg(target_os = "windows")]
+    const CURRENT_OS: &str = "windows";
+    // Fall-back for any other (FreeBSD, Haiku, …) build host.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    const CURRENT_OS: &str = "";
+
+    const KNOWN: &[&str] = &["darwin", "linux", "windows"];
+
+    if name == CURRENT_OS {
+        CondResult::AlwaysTrue
+    } else if KNOWN.contains(&name) {
+        CondResult::AlwaysFalse
+    } else {
+        CondResult::Unknown(Cond::Os(name.to_owned()))
     }
 }
 
@@ -395,6 +432,130 @@ mod tests {
             matches!(&unknown[0], Node::If(n) if matches!(&n.cond, Cond::Not(_))),
             "not(have) should remain as Not(Have): {:?}",
             unknown
+        );
+    }
+
+    // -- Os static folding via #[cfg(target_os)] ---------------------------------
+
+    /// On a Linux build host, `os linux` folds to AlwaysTrue (body inlined),
+    /// `os darwin` and `os windows` fold to AlwaysFalse (dropped).
+    /// This test is compiled on all platforms but asserts the correct result
+    /// for the current compile target only.
+    #[test]
+    fn os_static_fold_linux_target() {
+        // os linux -> should be AlwaysTrue on linux, AlwaysFalse on others
+        let nodes_linux = vec![Node::If(bare_if(
+            Cond::Os("linux".into()),
+            vec![set("LINUX")],
+        ))];
+        let out_linux = prune_nodes(nodes_linux, "bash");
+
+        // os darwin -> should be AlwaysTrue on macos, AlwaysFalse on others
+        let nodes_darwin = vec![Node::If(bare_if(
+            Cond::Os("darwin".into()),
+            vec![set("DARWIN")],
+        ))];
+        let out_darwin = prune_nodes(nodes_darwin, "bash");
+
+        // os windows -> should be AlwaysTrue on windows, AlwaysFalse on others
+        let nodes_win = vec![Node::If(bare_if(
+            Cond::Os("windows".into()),
+            vec![set("WIN")],
+        ))];
+        let out_win = prune_nodes(nodes_win, "bash");
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                out_linux.len(),
+                1,
+                "os linux should inline on linux: {:?}",
+                out_linux
+            );
+            assert!(
+                out_darwin.is_empty(),
+                "os darwin should be dropped on linux: {:?}",
+                out_darwin
+            );
+            assert!(
+                out_win.is_empty(),
+                "os windows should be dropped on linux: {:?}",
+                out_win
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                out_linux.is_empty(),
+                "os linux should be dropped on macos: {:?}",
+                out_linux
+            );
+            assert_eq!(
+                out_darwin.len(),
+                1,
+                "os darwin should inline on macos: {:?}",
+                out_darwin
+            );
+            assert!(
+                out_win.is_empty(),
+                "os windows should be dropped on macos: {:?}",
+                out_win
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                out_linux.is_empty(),
+                "os linux should be dropped on windows: {:?}",
+                out_linux
+            );
+            assert!(
+                out_darwin.is_empty(),
+                "os darwin should be dropped on windows: {:?}",
+                out_darwin
+            );
+            assert_eq!(
+                out_win.len(),
+                1,
+                "os windows should inline on windows: {:?}",
+                out_win
+            );
+        }
+    }
+
+    /// Unknown OS names stay as Unknown (runtime check preserved).
+    #[test]
+    fn os_unknown_name_stays_unknown() {
+        let out = prune_nodes(
+            vec![Node::If(bare_if(
+                Cond::Os("haiku".into()),
+                vec![set("HAIKU")],
+            ))],
+            "bash",
+        );
+        assert_eq!(out.len(), 1, "unknown os should stay as If node: {:?}", out);
+        assert!(
+            matches!(&out[0], Node::If(n) if matches!(&n.cond, Cond::Os(_))),
+            "should remain as Os cond: {:?}",
+            out
+        );
+    }
+
+    /// `exists` is always runtime-unknown — never folded.
+    #[test]
+    fn exists_is_never_folded() {
+        let out = prune_nodes(
+            vec![Node::If(bare_if(
+                Cond::Exists("/home/user/.cargo/bin".into()),
+                vec![set("CARGO_PATH")],
+            ))],
+            "bash",
+        );
+        assert_eq!(out.len(), 1, "exists should stay as If node: {:?}", out);
+        assert!(
+            matches!(&out[0], Node::If(n) if matches!(&n.cond, Cond::Exists(_))),
+            "should remain as Exists cond: {:?}",
+            out
         );
     }
 }

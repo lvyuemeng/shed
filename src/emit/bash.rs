@@ -1,97 +1,153 @@
 use super::Emitter;
-use crate::ast::{Cond, IfNode, Node};
+use crate::ast::{Cond, IfNode, Node, PathDir};
 
 /// Emits POSIX-compatible sh/bash/zsh.
-/// `shell_name` is "bash" or "zsh" — used to fill {shell} in call args.
+/// `shell_name` is `"bash"` or `"zsh"` — `&'static str` means zero allocation.
 pub struct BashEmitter {
     pub shell_name: &'static str,
 }
 
 impl BashEmitter {
+    #[inline]
     pub fn new(name: &'static str) -> Self {
         Self { shell_name: name }
     }
 }
 
 impl Emitter for BashEmitter {
+    #[inline]
     fn name(&self) -> &str {
         self.shell_name
     }
 
     fn emit_nodes(&self, nodes: &[Node], d: usize) -> Vec<String> {
-        nodes.iter().flat_map(|n| self.node(n, d)).collect()
+        // Pre-allocate: most nodes produce exactly one line.
+        let mut out = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            self.node(n, d, &mut out);
+        }
+        out
+    }
+}
+
+/// Map the shed OS name to the `uname -s` output string.
+/// Pure branchless lookup — no allocation, always inlined.
+#[inline]
+pub fn os_uname_name(name: &str) -> &str {
+    match name {
+        "darwin"  => "Darwin",
+        "linux"   => "Linux",
+        "windows" => "Windows_NT",
+        other     => other,
     }
 }
 
 impl BashEmitter {
-    fn node(&self, n: &Node, d: usize) -> Vec<String> {
+    /// Push lines for `n` into `out`, avoiding a fresh `Vec` per node.
+    fn node(&self, n: &Node, d: usize, out: &mut Vec<String>) {
         match n {
-            Node::Set { key, val } => vec![self.indent(format!("export {}=\"{}\"", key, val), d)],
+            Node::Set { key, val } => {
+                out.push(self.indent(format!("export {}=\"{}\"", key, val), d));
+            }
 
-            Node::Path { dir, prepend } => {
-                let s = if *prepend {
-                    format!("export PATH=\"{}:$PATH\"", dir)
-                } else {
-                    format!("export PATH=\"$PATH:{}\"", dir)
+            Node::Path { dir, direction } => {
+                // Dedup guard: only mutate PATH when `dir` is not already present.
+                let (add, guard) = match direction {
+                    PathDir::Prepend => {
+                        let add = format!("export PATH=\"{}:$PATH\"", dir);
+                        let guard = format!("[[ \"${{PATH}}\" != *\"{}\"* ]] && {}", dir, add);
+                        (add, guard)
+                    }
+                    PathDir::Append => {
+                        let add = format!("export PATH=\"$PATH:{}\"", dir);
+                        let guard = format!("[[ \"${{PATH}}\" != *\"{}\"* ]] && {}", dir, add);
+                        (add, guard)
+                    }
                 };
-                vec![self.indent(s, d)]
+                let _ = add; // consumed into guard above
+                out.push(self.indent(guard, d));
             }
 
             Node::Call { cmd, args } => {
-                let a = args.replace("{shell}", self.name());
-                let a = a.trim();
+                let a = self.resolve_call_args(args);
                 let s = if a.is_empty() {
                     format!("eval \"$({})\"", cmd)
                 } else {
                     format!("eval \"$({} {})\"", cmd, a)
                 };
-                vec![self.indent(s, d)]
+                out.push(self.indent(s, d));
             }
 
             Node::Alias { name, body } => {
-                vec![self.indent(format!("alias {}='{}'", name, body), d)]
+                out.push(self.indent(format!("alias {}='{}'", name, body), d));
             }
 
-            Node::If(node) => self.emit_if(node, d),
+            Node::If(node) => self.emit_if(node, d, out),
         }
     }
 
+    /// Build the condition string.
+    ///
+    /// Compound nodes (`And`/`Or`) use exact-capacity `String::with_capacity`
+    /// to avoid a reallocation when concatenating two already-built sub-strings.
     fn cond(&self, c: &Cond) -> String {
         match c {
-            Cond::Have(cmd) => format!("command -v {} >/dev/null 2>&1", cmd),
-            Cond::Os(name) => {
-                let uname = match name.as_str() {
-                    "darwin" => "Darwin",
-                    "linux" => "Linux",
-                    "windows" => "Windows_NT",
-                    other => other,
-                };
-                format!("[ \"$(uname -s)\" = \"{}\" ]", uname)
-            }
-            Cond::Shell(name) => match name.as_str() {
+            Cond::Have(cmd)    => format!("command -v {} >/dev/null 2>&1", cmd),
+            Cond::Exists(path) => format!("[ -e \"{}\" ]", path),
+            Cond::Env(var)     => format!("[ -n \"${{{var}:-}}\" ]"),
+            Cond::Os(name)     => format!("[ \"$(uname -s)\" = \"{}\" ]", os_uname_name(name)),
+            Cond::Shell(name)  => match name.as_str() {
                 "bash" => "[ -n \"$BASH_VERSION\" ]".into(),
-                "zsh" => "[ -n \"$ZSH_VERSION\" ]".into(),
-                _ => "false".into(),
+                "zsh"  => "[ -n \"$ZSH_VERSION\" ]".into(),
+                _      => "false".into(),
             },
-            Cond::Not(inner) => format!("! {}", self.cond(inner)),
-            Cond::And(lhs, rhs) => format!("{} && {}", self.cond(lhs), self.cond(rhs)),
-            Cond::Or(lhs, rhs) => format!("{} || {}", self.cond(lhs), self.cond(rhs)),
+            Cond::Not(inner) => {
+                // "! " prefix: avoid an intermediate format string.
+                let mut s = String::from("! ");
+                s.push_str(&self.cond(inner));
+                s
+            }
+            Cond::And(lhs, rhs) => {
+                let l = self.cond(lhs);
+                let r = self.cond(rhs);
+                let mut s = String::with_capacity(l.len() + 4 + r.len());
+                s.push_str(&l);
+                s.push_str(" && ");
+                s.push_str(&r);
+                s
+            }
+            Cond::Or(lhs, rhs) => {
+                let l = self.cond(lhs);
+                let r = self.cond(rhs);
+                let mut s = String::with_capacity(l.len() + 4 + r.len());
+                s.push_str(&l);
+                s.push_str(" || ");
+                s.push_str(&r);
+                s
+            }
         }
     }
 
-    fn emit_if(&self, n: &IfNode, d: usize) -> Vec<String> {
-        let mut out = vec![self.indent(format!("if {}; then", self.cond(&n.cond)), d)];
-        out.extend(self.emit_nodes(&n.body, d + 1));
+    fn emit_if(&self, n: &IfNode, d: usize, out: &mut Vec<String>) {
+        // Reserve a lower-bound so the Vec rarely needs to grow.
+        out.reserve(2 + n.body.len() + n.elifs.len() * 2 + n.else_.len());
+        out.push(self.indent(format!("if {}; then", self.cond(&n.cond)), d));
+        for node in &n.body {
+            self.node(node, d + 1, out);
+        }
         for (c, b) in &n.elifs {
             out.push(self.indent(format!("elif {}; then", self.cond(c)), d));
-            out.extend(self.emit_nodes(b, d + 1));
+            for node in b {
+                self.node(node, d + 1, out);
+            }
         }
         if !n.else_.is_empty() {
             out.push(self.indent("else".into(), d));
-            out.extend(self.emit_nodes(&n.else_, d + 1));
+            for node in &n.else_ {
+                self.node(node, d + 1, out);
+            }
         }
         out.push(self.indent("fi".into(), d));
-        out
     }
 }
 
@@ -131,10 +187,16 @@ mod tests {
             &bash(),
             &[Node::Path {
                 dir: "/usr/local/bin".into(),
-                prepend: true,
+                direction: PathDir::Prepend,
             }],
         );
-        assert_eq!(out, "export PATH=\"/usr/local/bin:$PATH\"");
+        assert!(
+            out.contains("export PATH=\"/usr/local/bin:$PATH\""),
+            "add: {}",
+            out
+        );
+        assert!(out.contains("[[ "), "guard: {}", out);
+        assert!(out.contains("/usr/local/bin"), "dir: {}", out);
     }
 
     #[test]
@@ -143,10 +205,16 @@ mod tests {
             &bash(),
             &[Node::Path {
                 dir: "/opt/bin".into(),
-                prepend: false,
+                direction: PathDir::Append,
             }],
         );
-        assert_eq!(out, "export PATH=\"$PATH:/opt/bin\"");
+        assert!(
+            out.contains("export PATH=\"$PATH:/opt/bin\""),
+            "add: {}",
+            out
+        );
+        assert!(out.contains("[[ "), "guard: {}", out);
+        assert!(out.contains("/opt/bin"), "dir: {}", out);
     }
 
     #[test]
@@ -191,6 +259,24 @@ mod tests {
         assert_eq!(
             e.cond(&Cond::Have("git".into())),
             "command -v git >/dev/null 2>&1"
+        );
+    }
+
+    #[test]
+    fn cond_exists() {
+        let e = bash();
+        assert_eq!(
+            e.cond(&Cond::Exists("/home/user/.cargo/bin".into())),
+            "[ -e \"/home/user/.cargo/bin\" ]"
+        );
+    }
+
+    #[test]
+    fn cond_env() {
+        let e = bash();
+        assert_eq!(
+            e.cond(&Cond::Env("CARGO_HOME".into())),
+            "[ -n \"${CARGO_HOME:-}\" ]"
         );
     }
 

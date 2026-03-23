@@ -1,86 +1,113 @@
 use super::Emitter;
-use crate::ast::{Cond, IfNode, Node};
+use crate::ast::{Cond, IfNode, Node, PathDir};
+use crate::emit::bash::os_uname_name;
 
 pub struct FishEmitter;
 
 impl Emitter for FishEmitter {
+    #[inline]
     fn name(&self) -> &str {
         "fish"
     }
 
     fn emit_nodes(&self, nodes: &[Node], d: usize) -> Vec<String> {
-        nodes.iter().flat_map(|n| self.node(n, d)).collect()
+        let mut out = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            self.node(n, d, &mut out);
+        }
+        out
     }
 }
 
 impl FishEmitter {
-    fn node(&self, n: &Node, d: usize) -> Vec<String> {
+    fn node(&self, n: &Node, d: usize, out: &mut Vec<String>) {
         match n {
-            Node::Set { key, val } => vec![self.indent(format!("set -gx {} \"{}\"", key, val), d)],
+            Node::Set { key, val } => {
+                out.push(self.indent(format!("set -gx {} \"{}\"", key, val), d));
+            }
 
-            // fish_add_path deduplicates automatically — no double-PATH-entry problem
-            Node::Path { dir, prepend } => {
-                let flag = if *prepend { "-gP" } else { "-gaP" };
-                vec![self.indent(format!("fish_add_path {} \"{}\"", flag, dir), d)]
+            // `fish_add_path` deduplicates automatically — no double-PATH problem.
+            Node::Path { dir, direction } => {
+                let flag = match direction {
+                    PathDir::Prepend => "-gP",
+                    PathDir::Append  => "-gaP",
+                };
+                out.push(self.indent(format!("fish_add_path {} \"{}\"", flag, dir), d));
             }
 
             Node::Call { cmd, args } => {
-                let a = args.replace("{shell}", self.name());
-                let a = a.trim();
+                let a = self.resolve_call_args(args);
                 let s = if a.is_empty() {
                     format!("{} | source", cmd)
                 } else {
                     format!("{} {} | source", cmd, a)
                 };
-                vec![self.indent(s, d)]
+                out.push(self.indent(s, d));
             }
 
             Node::Alias { name, body } => {
-                vec![self.indent(format!("alias {} {}", name, body), d)]
+                out.push(self.indent(format!("alias {} {}", name, body), d));
             }
 
-            Node::If(node) => self.emit_if(node, d),
+            Node::If(node) => self.emit_if(node, d, out),
         }
     }
 
     fn cond(&self, c: &Cond) -> String {
         match c {
-            Cond::Have(cmd) => format!("type -q {}", cmd),
-            Cond::Os(name) => {
-                let uname = match name.as_str() {
-                    "darwin" => "Darwin",
-                    "linux" => "Linux",
-                    "windows" => "Windows_NT",
-                    other => other,
-                };
-                format!("test (uname -s) = \"{}\"", uname)
+            Cond::Have(cmd)    => format!("type -q {}", cmd),
+            Cond::Exists(path) => format!("test -e \"{}\"", path),
+            Cond::Env(var)     => format!("set -q {}", var),
+            Cond::Os(name)     => format!("test (uname -s) = \"{}\"", os_uname_name(name)),
+            Cond::Shell(name)  => {
+                if name == "fish" { "true".into() } else { "false".into() }
             }
-            Cond::Shell(name) => {
-                if name == "fish" {
-                    "true".into()
-                } else {
-                    "false".into()
-                }
+            Cond::Not(inner) => {
+                let mut s = String::from("not ");
+                s.push_str(&self.cond(inner));
+                s
             }
-            Cond::Not(inner) => format!("not {}", self.cond(inner)),
-            Cond::And(lhs, rhs) => format!("{}; and {}", self.cond(lhs), self.cond(rhs)),
-            Cond::Or(lhs, rhs) => format!("{}; or {}", self.cond(lhs), self.cond(rhs)),
+            Cond::And(lhs, rhs) => {
+                let l = self.cond(lhs);
+                let r = self.cond(rhs);
+                // fish uses `; and` separator — exact-capacity concat.
+                let mut s = String::with_capacity(l.len() + 6 + r.len());
+                s.push_str(&l);
+                s.push_str(";  and ");
+                s.push_str(&r);
+                s
+            }
+            Cond::Or(lhs, rhs) => {
+                let l = self.cond(lhs);
+                let r = self.cond(rhs);
+                let mut s = String::with_capacity(l.len() + 5 + r.len());
+                s.push_str(&l);
+                s.push_str(";  or ");
+                s.push_str(&r);
+                s
+            }
         }
     }
 
-    fn emit_if(&self, n: &IfNode, d: usize) -> Vec<String> {
-        let mut out = vec![self.indent(format!("if {}", self.cond(&n.cond)), d)];
-        out.extend(self.emit_nodes(&n.body, d + 1));
+    fn emit_if(&self, n: &IfNode, d: usize, out: &mut Vec<String>) {
+        out.reserve(2 + n.body.len() + n.elifs.len() * 2 + n.else_.len());
+        out.push(self.indent(format!("if {}", self.cond(&n.cond)), d));
+        for node in &n.body {
+            self.node(node, d + 1, out);
+        }
         for (c, b) in &n.elifs {
             out.push(self.indent(format!("else if {}", self.cond(c)), d));
-            out.extend(self.emit_nodes(b, d + 1));
+            for node in b {
+                self.node(node, d + 1, out);
+            }
         }
         if !n.else_.is_empty() {
             out.push(self.indent("else".into(), d));
-            out.extend(self.emit_nodes(&n.else_, d + 1));
+            for node in &n.else_ {
+                self.node(node, d + 1, out);
+            }
         }
         out.push(self.indent("end".into(), d));
-        out
     }
 }
 
@@ -108,7 +135,7 @@ mod tests {
     fn path_prepend() {
         let out = render(&[Node::Path {
             dir: "/usr/local/bin".into(),
-            prepend: true,
+            direction: PathDir::Prepend,
         }]);
         assert_eq!(out, "fish_add_path -gP \"/usr/local/bin\"");
     }
@@ -117,7 +144,7 @@ mod tests {
     fn path_append() {
         let out = render(&[Node::Path {
             dir: "/opt/bin".into(),
-            prepend: false,
+            direction: PathDir::Append,
         }]);
         assert_eq!(out, "fish_add_path -gaP \"/opt/bin\"");
     }
@@ -143,6 +170,22 @@ mod tests {
     #[test]
     fn cond_have() {
         assert_eq!(FishEmitter.cond(&Cond::Have("git".into())), "type -q git");
+    }
+
+    #[test]
+    fn cond_exists() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::Exists("/home/user/.cargo/bin".into())),
+            "test -e \"/home/user/.cargo/bin\""
+        );
+    }
+
+    #[test]
+    fn cond_env() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::Env("CARGO_HOME".into())),
+            "set -q CARGO_HOME"
+        );
     }
 
     #[test]
@@ -248,7 +291,7 @@ mod tests {
                 Box::new(Cond::Have("cargo".into())),
                 Box::new(Cond::Os("linux".into())),
             )),
-            "type -q cargo; and test (uname -s) = \"Linux\""
+            "type -q cargo;  and test (uname -s) = \"Linux\""
         );
     }
 
@@ -259,7 +302,7 @@ mod tests {
                 Box::new(Cond::Os("darwin".into())),
                 Box::new(Cond::Os("linux".into())),
             )),
-            "test (uname -s) = \"Darwin\"; or test (uname -s) = \"Linux\""
+            "test (uname -s) = \"Darwin\";  or test (uname -s) = \"Linux\""
         );
     }
 }
