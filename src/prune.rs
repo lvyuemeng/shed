@@ -22,13 +22,14 @@ use crate::ast::{Cond, IfNode, Node};
 ///
 /// Non-`If` nodes pass through unchanged.
 pub fn prune_nodes(nodes: Vec<Node>, shell: &str) -> Vec<Node> {
-    nodes
-        .into_iter()
-        .flat_map(|n| match n {
-            Node::If(inode) => prune_if(inode, shell),
-            other => vec![other],
-        })
-        .collect()
+    let mut out = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        match n {
+            Node::If(inode) => out.extend(prune_if(inode, shell)),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // -- private helpers ----------------------------------------------------------

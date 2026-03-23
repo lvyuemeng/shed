@@ -229,7 +229,31 @@ end";
     );
 }
 
-// ── parse-error quality ───────────────────────────────────────────────────────
+// -- alias keyword ----------------------------------------------------------
+
+/// `alias` emits the correct shell-specific alias syntax for each target.
+#[test]
+fn alias_all_shells() {
+    assert_eq!(bash("alias ll ls -la"), "alias ll='ls -la'");
+    assert_eq!(zsh("alias ll ls -la"), "alias ll='ls -la'");
+    assert_eq!(fish("alias ll ls -la"), "alias ll ls -la");
+    assert_eq!(pwsh("alias ll ls -la"), "Set-Alias ll ls -la");
+}
+
+/// `alias` with a single-word body.
+#[test]
+fn alias_single_word_body() {
+    assert_eq!(bash("alias g git"), "alias g='git'");
+    assert_eq!(fish("alias g git"), "alias g git");
+    assert_eq!(pwsh("alias g git"), "Set-Alias g git");
+}
+
+/// missing `alias` body is a parse error.
+#[test]
+fn alias_missing_body_is_error() {
+    assert!(Parser::new("alias ll").parse().is_err());
+    assert!(Parser::new("alias").parse().is_err());
+}
 
 /// Errors carry the 1-based source line and the offending token.
 #[test]

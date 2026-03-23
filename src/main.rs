@@ -40,6 +40,8 @@ DSL REFERENCE
   call cmd [args]             eval-init (starship, zoxide, …)
                               use {shell} as a placeholder for the target shell name
 
+  alias name body              define a shell alias
+
   if    have  <cmd>           guard: command must exist on PATH
   if    os    darwin|linux|windows
   if    shell bash|zsh|fish|pwsh
@@ -159,8 +161,9 @@ fn emit(shell: &str, ast: &[Node]) -> Result<String, String> {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    // --help / -h anywhere in the args prints usage and exits cleanly.
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    // --help / -h anywhere in the args, or bare invocation with no subcommand,
+    // prints usage to stdout and exits cleanly (exit 0).
+    if args.iter().any(|a| a == "--help" || a == "-h") || args.len() < 2 {
         print!("{}", USAGE);
         return Ok(());
     }

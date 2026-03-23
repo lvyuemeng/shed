@@ -48,6 +48,10 @@ impl BashEmitter {
                 vec![self.indent(s, d)]
             }
 
+            Node::Alias { name, body } => {
+                vec![self.indent(format!("alias {}='{}'", name, body), d)]
+            }
+
             Node::If(node) => self.emit_if(node, d),
         }
     }

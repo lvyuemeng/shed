@@ -31,8 +31,9 @@ impl std::fmt::Display for ParseError {
 #[derive(Debug, Clone)]
 pub enum Node {
     Set { key: String, val: String },
-    Path { dir: String, prepend: bool }, // path+ / path-
-    Call { cmd: String, args: String },  // eval-init style (starship, zoxide…)
+    Path { dir: String, prepend: bool },  // path+ / path-
+    Call { cmd: String, args: String },   // eval-init style (starship, zoxide…)
+    Alias { name: String, body: String }, // alias name body
     If(IfNode),
 }
 

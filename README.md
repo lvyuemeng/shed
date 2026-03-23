@@ -54,6 +54,7 @@ shed pwsh ~/.config/shed/env.shed | Invoke-Expression
 | `path+` | `path+ dir` | Prepend `dir` to `PATH` |
 | `path-` | `path- dir` | Append `dir` to `PATH` |
 | `call` | `call cmd [args…]` | Run `cmd --init {shell}` style initialisers; `{shell}` expands to the target shell name |
+| `alias` | `alias name body` | Define a shell alias |
 
 ### conditions
 
@@ -99,6 +100,10 @@ set KEY value  # inline comment
 ```sh
 set EDITOR nvim
 
+# shell aliases
+alias ll ls -la
+alias g git
+
 # per-OS browser
 if os darwin
   set BROWSER open
@@ -127,6 +132,8 @@ end
 
 ```sh
 export EDITOR="nvim"
+alias ll='ls -la'
+alias g='git'
 if [ "$(uname -s)" = "Darwin" ]; then
   export BROWSER="open"
 elif [ "$(uname -s)" = "Linux" ]; then
@@ -150,6 +157,8 @@ fi
 
 ```fish
 set -gx EDITOR "nvim"
+alias ll ls -la
+alias g git
 if test (uname -s) = "Darwin"
   set -gx BROWSER "open"
 else if test (uname -s) = "Linux"
@@ -173,6 +182,8 @@ end
 
 ```powershell
 $env:EDITOR = "nvim"
+Set-Alias ll ls -la
+Set-Alias g git
 if ($IsMacOS) {
   $env:BROWSER = "open"
 } elseif ($IsLinux) {

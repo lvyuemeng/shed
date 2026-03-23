@@ -86,6 +86,19 @@ impl Parser {
                 self.pos += 1;
                 Ok(Node::Call { cmd, args })
             }
+            "alias" => {
+                let name = toks
+                    .get(1)
+                    .ok_or_else(|| ParseError::at(ln, "usage: alias NAME BODY"))?
+                    .clone();
+                let body = toks
+                    .get(2..)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.join(" "))
+                    .ok_or_else(|| ParseError::at(ln, "usage: alias NAME BODY"))?;
+                self.pos += 1;
+                Ok(Node::Alias { name, body })
+            }
             "if" => {
                 // toks[1..] is the condition token list; must be non-empty.
                 let cond_slice = toks
@@ -193,7 +206,11 @@ impl Parser {
 
         // Flat loop: consume elif*/else?/end; return Ok on `end`, error on EOF.
         loop {
-            match self.peek().map(|(ln, t)| (ln, t[0].clone())) {
+            // SAFETY: new() guarantees every stored line has >=1 token.
+            match self
+                .peek()
+                .and_then(|(ln, t)| t.first().map(|kw| (ln, kw.clone())))
+            {
                 None => break,
                 Some((_, kw)) if kw == "end" => {
                     self.pos += 1;
