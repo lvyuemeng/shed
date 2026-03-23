@@ -42,10 +42,12 @@ DSL REFERENCE
 
   alias name body              define a shell alias
 
-  if    have  <cmd>           guard: command must exist on PATH
-  if    os    darwin|linux|windows
-  if    shell bash|zsh|fish|pwsh
-  if    not   <cond>          negate a condition
+  if    have   <cmd>          guard: command must exist on PATH
+  if    exists <path>         guard: path exists on filesystem at shell startup
+  if    env    <VAR>          guard: env-var is set and non-empty
+  if    os     darwin|linux|windows
+  if    shell  bash|zsh|fish|pwsh
+  if    not    <cond>         negate a condition
   if    <cond> and <cond>     both conditions must hold
   if    <cond> or  <cond>     either condition must hold
   elif  …
@@ -55,10 +57,11 @@ DSL REFERENCE
   # comment (inline or full-line)
 
   COMPOUND CONDITIONS (precedence: not > and > or)
-  if not have cargo              negate a single condition
-  if have cargo and os linux     both must hold
-  if os darwin or os linux       either holds
-  if not have cargo and os linux parsed as: (not have cargo) and (os linux)
+  if not have cargo                        negate
+  if have cargo and os linux               both must hold
+  if os darwin or os linux                 either holds
+  if not have nvim and shell bash          not binds tighter than and
+  if have cargo or os linux and shell bash and binds tighter than or
 ";
 
 /// Read source from `path` (a file) or from stdin when `path` is `None`.
