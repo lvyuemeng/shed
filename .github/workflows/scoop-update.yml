@@ -2,18 +2,18 @@ name: Update Scoop Manifest
 
 # Runs automatically after the Release workflow completes successfully.
 # It downloads the Windows binary from the new GitHub Release, computes
-# its SHA-256 hash, updates bucket/shed.json, and commits the change.
+# its SHA-256 hash, updates shed.json, and commits the change.
 
 on:
   release:
-    types: [published]
+    types: [created, published]
 
 permissions:
   contents: write
 
 jobs:
   update-manifest:
-    name: Update bucket/shed.json
+    name: Update shed.json
     runs-on: ubuntu-latest
 
     steps:
@@ -48,7 +48,7 @@ jobs:
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
           echo "SHA-256: $HASH"
 
-      # ── Patch bucket/shed.json in-place ──────────────────────────────────
+      # ── Patch shed.json in-place ──────────────────────────────────
       - name: Update manifest
         env:
           VERSION: ${{ steps.version.outputs.ver }}
@@ -76,7 +76,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add bucket/shed.json
+          git add shed.json
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "chore: update scoop manifest to ${{ steps.version.outputs.tag }}"
           git push
