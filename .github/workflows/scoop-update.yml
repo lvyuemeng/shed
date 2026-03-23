@@ -5,8 +5,9 @@ name: Update Scoop Manifest
 # its SHA-256 hash, updates shed.json, and commits the change.
 
 on:
-  release:
-    types: [created, published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 permissions:
   contents: write
@@ -15,6 +16,7 @@ jobs:
   update-manifest:
     name: Update shed.json
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -26,7 +28,7 @@ jobs:
       - name: Set version
         id: version
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ github.event.workflow_run.head_branch }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
 
