@@ -59,7 +59,7 @@ DSL REFERENCE
 PATH HANDLING
   Shell variables ($HOME, $env:USERPROFILE, ~, $CARGO_HOME, …) in path+, path-,
   set values, and exists paths are left as-is for the target shell to expand.
-  Only the path delimiter is normalised: \ → / on all platforms so that
+  Only the path delimiter is normalised: backslash to forward slash on all platforms so that
   bash/fish/zsh/pwsh all accept the output.
   Relative paths (no variable, no leading /) are resolved against the shed
   file's directory at parse time so the file is portable.
@@ -130,8 +130,8 @@ fn run(args: &[String]) -> Result<(), String> {
 
     // Parse and resolve paths in one step: Parser::new takes the base dir so
     // `path+` / `path-` tokens are normalised during parsing — no separate pass.
-    let parsed = read(file)
-        .and_then(|src| Parser::new(&src, base).parse().map_err(|e| e.to_string()))?;
+    let parsed =
+        read(file).and_then(|src| Parser::new(&src, base).parse().map_err(|e| e.to_string()))?;
 
     if shell == "check" {
         println!("ok ({} top-level nodes)", parsed.len());

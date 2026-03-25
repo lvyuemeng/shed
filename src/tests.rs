@@ -46,20 +46,43 @@ fn set_all_shells() {
 #[test]
 fn path_prepend_and_append() {
     let b_prepend = bash("path+ /usr/local/bin");
-    assert!(b_prepend.contains("export PATH=\"/usr/local/bin:$PATH\""), "bash prepend add: {}", b_prepend);
-    assert!(b_prepend.contains("[[ "), "bash prepend guard: {}", b_prepend);
+    assert!(
+        b_prepend.contains("export PATH=\"/usr/local/bin:$PATH\""),
+        "bash prepend add: {}",
+        b_prepend
+    );
+    assert!(
+        b_prepend.contains("[[ "),
+        "bash prepend guard: {}",
+        b_prepend
+    );
 
     let b_append = bash("path- /opt/bin");
-    assert!(b_append.contains("export PATH=\"$PATH:/opt/bin\""), "bash append add: {}", b_append);
+    assert!(
+        b_append.contains("export PATH=\"$PATH:/opt/bin\""),
+        "bash append add: {}",
+        b_append
+    );
     assert!(b_append.contains("[[ "), "bash append guard: {}", b_append);
 
     // fish_add_path deduplicates natively -- no extra guard needed.
-    assert_eq!(fish("path+ /usr/local/bin"), "fish_add_path -gP \"/usr/local/bin\"");
+    assert_eq!(
+        fish("path+ /usr/local/bin"),
+        "fish_add_path -gP \"/usr/local/bin\""
+    );
     assert_eq!(fish("path- /opt/bin"), "fish_add_path -gaP \"/opt/bin\"");
 
-    let p_prepend = pwsh("path+ C:\\tools");
-    assert!(p_prepend.contains("$env:PATH = \"C:\\tools;$env:PATH\""), "pwsh prepend add: {}", p_prepend);
-    assert!(p_prepend.contains("-notlike"), "pwsh prepend guard: {}", p_prepend);
+    let p_prepend = pwsh("path+ C:/tools");
+    assert!(
+        p_prepend.contains("$env:PATH = \"C:/tools;$env:PATH\""),
+        "pwsh prepend add: {}",
+        p_prepend
+    );
+    assert!(
+        p_prepend.contains("-notlike"),
+        "pwsh prepend guard: {}",
+        p_prepend
+    );
 }
 
 /// call replaces {shell} with the actual shell name.
@@ -303,7 +326,10 @@ fn alias_all_shells() {
     assert_eq!(bash("alias ll ls -la"), "alias ll='ls -la'");
     assert_eq!(zsh("alias ll ls -la"), "alias ll='ls -la'");
     assert_eq!(fish("alias ll ls -la"), "alias ll ls -la");
-    assert_eq!(pwsh("alias ll ls -la"), "Set-Alias ll ls -la");
+    assert_eq!(
+        pwsh("alias ll ls -la"),
+        "Set-Alias -Scope Global -Name ll -Value ls -la"
+    );
 }
 
 /// `alias` with a single-word body.
@@ -311,7 +337,10 @@ fn alias_all_shells() {
 fn alias_single_word_body() {
     assert_eq!(bash("alias g git"), "alias g='git'");
     assert_eq!(fish("alias g git"), "alias g git");
-    assert_eq!(pwsh("alias g git"), "Set-Alias g git");
+    assert_eq!(
+        pwsh("alias g git"),
+        "Set-Alias -Scope Global -Name g -Value git"
+    );
 }
 
 /// missing `alias` body is a parse error.
@@ -324,12 +353,16 @@ fn alias_missing_body_is_error() {
 /// Errors carry the 1-based source line and the offending token.
 #[test]
 fn parse_errors_carry_line_and_context() {
-    let err = Parser::new("set A 1\nsett FOO bar", None).parse().unwrap_err();
+    let err = Parser::new("set A 1\nsett FOO bar", None)
+        .parse()
+        .unwrap_err();
     assert_eq!(err.line, 2, "wrong line: {}", err);
     assert!(err.msg.contains("sett"), "wrong msg: {}", err);
 
     // Missing set value — points to the correct line
-    let err = Parser::new("set A 1\nset B 2\nset C", None).parse().unwrap_err();
+    let err = Parser::new("set A 1\nset B 2\nset C", None)
+        .parse()
+        .unwrap_err();
     assert_eq!(err.line, 3, "wrong line: {}", err);
 
     // Unterminated if — points to the opening `if` line
@@ -376,9 +409,20 @@ fn if_and_condition_all_shells() {
         assert!(b.contains("command -v cargo"), "bash and lhs: {}", b);
         // os linux was folded out — the if-condition line has no && (the dedup guard
         // inside the body has &&, but the if-line itself should not).
-        let if_line = b.lines().find(|l| l.trim_start().starts_with("if ")).unwrap_or("");
-        assert!(!if_line.contains("&&"), "bash linux: unexpected && in if-line: {}", if_line);
-        assert!(!b.contains("Linux"), "bash linux: unexpected Linux string: {}", b);
+        let if_line = b
+            .lines()
+            .find(|l| l.trim_start().starts_with("if "))
+            .unwrap_or("");
+        assert!(
+            !if_line.contains("&&"),
+            "bash linux: unexpected && in if-line: {}",
+            if_line
+        );
+        assert!(
+            !b.contains("Linux"),
+            "bash linux: unexpected Linux string: {}",
+            b
+        );
     }
     #[cfg(target_os = "macos")]
     assert!(
@@ -397,7 +441,11 @@ fn if_and_condition_all_shells() {
     #[cfg(target_os = "linux")]
     {
         assert!(f.contains("type -q cargo"), "fish and lhs: {}", f);
-        assert!(!f.contains(";  and  "), "fish linux: unexpected ;  and : {}", f);
+        assert!(
+            !f.contains(";  and  "),
+            "fish linux: unexpected ;  and : {}",
+            f
+        );
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -687,7 +735,11 @@ fn if_env_all_shells() {
     assert!(f.contains("if "), "fish if wrapper: {}", f);
 
     let p = pwsh(src);
-    assert!(p.contains("Test-Path env:CARGO_HOME"), "pwsh env cond: {}", p);
+    assert!(
+        p.contains("Test-Path env:CARGO_HOME"),
+        "pwsh env cond: {}",
+        p
+    );
     assert!(p.contains("if ("), "pwsh if wrapper: {}", p);
 }
 
@@ -700,13 +752,18 @@ fn path_dedup_guard_present() {
     assert!(b.contains("[[ "), "bash guard missing: {}", b);
     assert!(b.contains("/usr/local/bin"), "bash dir missing: {}", b);
     // Should not appear twice
-    assert_eq!(b.matches("/usr/local/bin").count(), 2, "bash dir count: {}", b); // once in guard, once in add
+    assert_eq!(
+        b.matches("/usr/local/bin").count(),
+        2,
+        "bash dir count: {}",
+        b
+    ); // once in guard, once in add
 
     // fish_add_path already deduplicates — no extra wrapper.
     let f = fish("path+ /usr/local/bin");
     assert!(!f.contains("[[ "), "fish: unexpected guard: {}", f);
 
-    let p = pwsh("path+ C:\\tools");
+    let p = pwsh("path+ C:/tools");
     assert!(p.contains("-notlike"), "pwsh guard missing: {}", p);
-    assert!(p.contains("C:\\tools"), "pwsh dir missing: {}", p);
+    assert!(p.contains("C:/tools"), "pwsh dir missing: {}", p);
 }

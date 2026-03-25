@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    env,
     path::{Path, PathBuf},
 };
 
@@ -36,7 +35,7 @@ fn strip_quotes(s: &str) -> Cow<'_, str> {
 fn tok(toks: &[String], idx: usize, ln: usize, msg: &str) -> Result<String, ParseError> {
     toks.get(idx)
         .ok_or_else(|| ParseError::at(ln, msg))
-        .map(|s| s.clone())
+        .cloned()
 }
 
 /// Return token at `idx` with outer quotes stripped.
@@ -73,18 +72,7 @@ fn last_op_pos(toks: &[String], op: &str) -> Option<usize> {
         .find_map(|(i, t)| (t == op && i >= 2 && i + 1 < toks.len()).then_some(i))
 }
 
-/// Resolve a path token from a shed source file.
-///
-/// Rules (applied in order):
-/// 1. `~` prefix → expand to `$HOME` (Unix) or `$USERPROFILE` (Windows).
-///    If neither variable is set the `~` is left as-is.
-/// 2. Relative path → join onto `base` (the shed file's directory).
-///    When `base` is `None` (stdin) relative paths are kept as-is.
-/// 3. Absolute path → returned unchanged.
-///
-/// No I/O is performed; the resolved path need not exist.
-/// The returned string always uses forward slashes so bash/fish/zsh output is
-/// correct on every host OS. PowerShell also accepts `/`.
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Return `true` when `s` contains a shell variable reference that must be
 /// left for the target shell to expand at runtime.

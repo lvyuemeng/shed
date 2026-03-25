@@ -6,13 +6,16 @@
 #[derive(Debug)]
 pub struct ParseError {
     pub line: usize,
-    pub msg:  String,
+    pub msg: String,
 }
 
 impl ParseError {
     #[inline]
     pub fn at(line: usize, msg: impl Into<String>) -> Self {
-        Self { line, msg: msg.into() }
+        Self {
+            line,
+            msg: msg.into(),
+        }
     }
 }
 
@@ -34,23 +37,23 @@ impl std::fmt::Display for ParseError {
 #[repr(u8)]
 pub enum PathDir {
     Prepend = 0, // path+
-    Append  = 1, // path-
+    Append = 1,  // path-
 }
 
 /// A single statement in a .shed source file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
-    Set   { key: String, val: String },
-    Path  { dir: String, direction: PathDir }, // path+ / path-
-    Call  { cmd: String, args: String },        // eval-init style (starship, zoxide…)
-    Alias { name: String, body: String },       // alias name body
+    Set { key: String, val: String },
+    Path { dir: String, direction: PathDir }, // path+ / path-
+    Call { cmd: String, args: String },       // eval-init style (starship, zoxide…)
+    Alias { name: String, body: String },     // alias name body
     If(IfNode),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfNode {
-    pub cond:  Cond,
-    pub body:  Vec<Node>,
+    pub cond: Cond,
+    pub body: Vec<Node>,
     pub elifs: Vec<(Cond, Vec<Node>)>,
     pub else_: Vec<Node>,
 }
