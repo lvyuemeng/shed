@@ -40,7 +40,7 @@ DSL REFERENCE
   call cmd [args]             eval-init (starship, zoxide, …)
                               use {shell} as a placeholder for the target shell name
 
-  alias name body              define a shell alias
+  alias name body             define a shell alias
 
   if    have   <cmd>          guard: command must exist on PATH
   if    exists <path>         guard: path exists on filesystem at shell startup
@@ -55,6 +55,14 @@ DSL REFERENCE
   end
 
   # comment (inline or full-line)
+
+PATH HANDLING
+  Shell variables ($HOME, $env:USERPROFILE, ~, $CARGO_HOME, …) in path+, path-,
+  set values, and exists paths are left as-is for the target shell to expand.
+  Only the path delimiter is normalised: \ → / on all platforms so that
+  bash/fish/zsh/pwsh all accept the output.
+  Relative paths (no variable, no leading /) are resolved against the shed
+  file's directory at parse time so the file is portable.
 
   COMPOUND CONDITIONS (precedence: not > and > or)
   if not have cargo                        negate

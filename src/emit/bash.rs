@@ -21,7 +21,6 @@ impl Emitter for BashEmitter {
     }
 
     fn emit_nodes(&self, nodes: &[Node], d: usize) -> Vec<String> {
-        // Pre-allocate: most nodes produce exactly one line.
         let mut out = Vec::with_capacity(nodes.len());
         for n in nodes {
             self.node(n, d, &mut out);
@@ -35,15 +34,14 @@ impl Emitter for BashEmitter {
 #[inline]
 pub fn os_uname_name(name: &str) -> &str {
     match name {
-        "darwin"  => "Darwin",
-        "linux"   => "Linux",
+        "darwin" => "Darwin",
+        "linux" => "Linux",
         "windows" => "Windows_NT",
-        other     => other,
+        other => other,
     }
 }
 
 impl BashEmitter {
-    /// Push lines for `n` into `out`, avoiding a fresh `Vec` per node.
     fn node(&self, n: &Node, d: usize, out: &mut Vec<String>) {
         match n {
             Node::Set { key, val } => {
@@ -51,30 +49,22 @@ impl BashEmitter {
             }
 
             Node::Path { dir, direction } => {
-                // Dedup guard: only mutate PATH when `dir` is not already present.
-                let (add, guard) = match direction {
-                    PathDir::Prepend => {
-                        let add = format!("export PATH=\"{}:$PATH\"", dir);
-                        let guard = format!("[[ \"${{PATH}}\" != *\"{}\"* ]] && {}", dir, add);
-                        (add, guard)
-                    }
-                    PathDir::Append => {
-                        let add = format!("export PATH=\"$PATH:{}\"", dir);
-                        let guard = format!("[[ \"${{PATH}}\" != *\"{}\"* ]] && {}", dir, add);
-                        (add, guard)
-                    }
+                // Build the guard directly — no intermediate `add` binding needed.
+                let guard = match direction {
+                    PathDir::Prepend => format!(
+                        "[[ \"${{PATH}}\" != *\"{}\"* ]] && export PATH=\"{}:$PATH\"",
+                        dir, dir
+                    ),
+                    PathDir::Append => format!(
+                        "[[ \"${{PATH}}\" != *\"{}\"* ]] && export PATH=\"$PATH:{}\"",
+                        dir, dir
+                    ),
                 };
-                let _ = add; // consumed into guard above
                 out.push(self.indent(guard, d));
             }
 
             Node::Call { cmd, args } => {
-                let a = self.resolve_call_args(args);
-                let s = if a.is_empty() {
-                    format!("eval \"$({})\"", cmd)
-                } else {
-                    format!("eval \"$({} {})\"", cmd, a)
-                };
+                let s = self.format_call(cmd, args, "eval \"$(", ")\"");
                 out.push(self.indent(s, d));
             }
 
@@ -92,17 +82,16 @@ impl BashEmitter {
     /// to avoid a reallocation when concatenating two already-built sub-strings.
     fn cond(&self, c: &Cond) -> String {
         match c {
-            Cond::Have(cmd)    => format!("command -v {} >/dev/null 2>&1", cmd),
+            Cond::Have(cmd) => format!("command -v {} >/dev/null 2>&1", cmd),
             Cond::Exists(path) => format!("[ -e \"{}\" ]", path),
-            Cond::Env(var)     => format!("[ -n \"${{{var}:-}}\" ]"),
-            Cond::Os(name)     => format!("[ \"$(uname -s)\" = \"{}\" ]", os_uname_name(name)),
-            Cond::Shell(name)  => match name.as_str() {
+            Cond::Env(var) => format!("[ -n \"${{{var}:-}}\" ]"),
+            Cond::Os(name) => format!("[ \"$(uname -s)\" = \"{}\" ]", os_uname_name(name)),
+            Cond::Shell(name) => match name.as_str() {
                 "bash" => "[ -n \"$BASH_VERSION\" ]".into(),
-                "zsh"  => "[ -n \"$ZSH_VERSION\" ]".into(),
-                _      => "false".into(),
+                "zsh" => "[ -n \"$ZSH_VERSION\" ]".into(),
+                _ => "false".into(),
             },
             Cond::Not(inner) => {
-                // "! " prefix: avoid an intermediate format string.
                 let mut s = String::from("! ");
                 s.push_str(&self.cond(inner));
                 s
@@ -129,7 +118,6 @@ impl BashEmitter {
     }
 
     fn emit_if(&self, n: &IfNode, d: usize, out: &mut Vec<String>) {
-        // Reserve a lower-bound so the Vec rarely needs to grow.
         out.reserve(2 + n.body.len() + n.elifs.len() * 2 + n.else_.len());
         out.push(self.indent(format!("if {}; then", self.cond(&n.cond)), d));
         for node in &n.body {
@@ -169,17 +157,23 @@ mod tests {
         e.render(nodes)
     }
 
+    // ── Node::Set ─────────────────────────────────────────────────────────────
+
     #[test]
     fn set() {
-        let out = render(
-            &bash(),
-            &[Node::Set {
-                key: "EDITOR".into(),
-                val: "nvim".into(),
-            }],
+        assert_eq!(
+            render(
+                &bash(),
+                &[Node::Set {
+                    key: "EDITOR".into(),
+                    val: "nvim".into()
+                }]
+            ),
+            "export EDITOR=\"nvim\""
         );
-        assert_eq!(out, "export EDITOR=\"nvim\"");
     }
+
+    // ── Node::Path ────────────────────────────────────────────────────────────
 
     #[test]
     fn path_prepend() {
@@ -196,7 +190,6 @@ mod tests {
             out
         );
         assert!(out.contains("[[ "), "guard: {}", out);
-        assert!(out.contains("/usr/local/bin"), "dir: {}", out);
     }
 
     #[test]
@@ -214,122 +207,170 @@ mod tests {
             out
         );
         assert!(out.contains("[[ "), "guard: {}", out);
-        assert!(out.contains("/opt/bin"), "dir: {}", out);
     }
+
+    // ── Node::Call ────────────────────────────────────────────────────────────
 
     #[test]
     fn call_with_shell_placeholder() {
-        let out = render(
-            &bash(),
-            &[Node::Call {
-                cmd: "starship".into(),
-                args: "init {shell}".into(),
-            }],
+        assert_eq!(
+            render(
+                &bash(),
+                &[Node::Call {
+                    cmd: "starship".into(),
+                    args: "init {shell}".into()
+                }]
+            ),
+            "eval \"$(starship init bash)\""
         );
-        assert_eq!(out, "eval \"$(starship init bash)\"");
     }
 
     #[test]
     fn call_shell_placeholder_zsh() {
-        let out = render(
-            &zsh(),
-            &[Node::Call {
-                cmd: "starship".into(),
-                args: "init {shell}".into(),
-            }],
+        assert_eq!(
+            render(
+                &zsh(),
+                &[Node::Call {
+                    cmd: "starship".into(),
+                    args: "init {shell}".into()
+                }]
+            ),
+            "eval \"$(starship init zsh)\""
         );
-        assert_eq!(out, "eval \"$(starship init zsh)\"");
     }
 
     #[test]
     fn call_no_args() {
-        let out = render(
-            &bash(),
-            &[Node::Call {
-                cmd: "myprog".into(),
-                args: String::new(),
-            }],
+        assert_eq!(
+            render(
+                &bash(),
+                &[Node::Call {
+                    cmd: "myprog".into(),
+                    args: String::new()
+                }]
+            ),
+            "eval \"$(myprog)\""
         );
-        assert_eq!(out, "eval \"$(myprog)\"");
     }
+
+    // ── Node::Alias ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn alias_single_quoted() {
+        assert_eq!(
+            render(
+                &bash(),
+                &[Node::Alias {
+                    name: "ll".into(),
+                    body: "ls -la".into()
+                }]
+            ),
+            "alias ll='ls -la'"
+        );
+    }
+
+    // ── conditions ────────────────────────────────────────────────────────────
 
     #[test]
     fn cond_have() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Have("git".into())),
+            bash().cond(&Cond::Have("git".into())),
             "command -v git >/dev/null 2>&1"
         );
     }
 
     #[test]
     fn cond_exists() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Exists("/home/user/.cargo/bin".into())),
+            bash().cond(&Cond::Exists("/home/user/.cargo/bin".into())),
             "[ -e \"/home/user/.cargo/bin\" ]"
         );
     }
 
     #[test]
     fn cond_env() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Env("CARGO_HOME".into())),
+            bash().cond(&Cond::Env("CARGO_HOME".into())),
             "[ -n \"${CARGO_HOME:-}\" ]"
         );
     }
 
     #[test]
     fn cond_os_darwin() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Os("darwin".into())),
+            bash().cond(&Cond::Os("darwin".into())),
             "[ \"$(uname -s)\" = \"Darwin\" ]"
         );
     }
 
     #[test]
     fn cond_os_linux() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Os("linux".into())),
+            bash().cond(&Cond::Os("linux".into())),
             "[ \"$(uname -s)\" = \"Linux\" ]"
         );
     }
 
     #[test]
     fn cond_os_windows() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Os("windows".into())),
+            bash().cond(&Cond::Os("windows".into())),
             "[ \"$(uname -s)\" = \"Windows_NT\" ]"
         );
     }
 
     #[test]
     fn cond_shell_bash() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Shell("bash".into())),
+            bash().cond(&Cond::Shell("bash".into())),
             "[ -n \"$BASH_VERSION\" ]"
         );
     }
 
     #[test]
     fn cond_shell_zsh() {
-        let e = bash();
         assert_eq!(
-            e.cond(&Cond::Shell("zsh".into())),
+            bash().cond(&Cond::Shell("zsh".into())),
             "[ -n \"$ZSH_VERSION\" ]"
         );
     }
 
     #[test]
     fn cond_shell_other_is_false() {
-        let e = bash();
-        assert_eq!(e.cond(&Cond::Shell("fish".into())), "false");
+        assert_eq!(bash().cond(&Cond::Shell("fish".into())), "false");
     }
+
+    #[test]
+    fn cond_not() {
+        assert_eq!(
+            bash().cond(&Cond::Not(Box::new(Cond::Have("git".into())))),
+            "! command -v git >/dev/null 2>&1"
+        );
+    }
+
+    #[test]
+    fn cond_and() {
+        assert_eq!(
+            bash().cond(&Cond::And(
+                Box::new(Cond::Have("cargo".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "command -v cargo >/dev/null 2>&1 && [ \"$(uname -s)\" = \"Linux\" ]"
+        );
+    }
+
+    #[test]
+    fn cond_or() {
+        assert_eq!(
+            bash().cond(&Cond::Or(
+                Box::new(Cond::Os("darwin".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "[ \"$(uname -s)\" = \"Darwin\" ] || [ \"$(uname -s)\" = \"Linux\" ]"
+        );
+    }
+
+    // ── if / elif / else / fi ─────────────────────────────────────────────────
 
     #[test]
     fn if_then_fi() {
@@ -390,39 +431,6 @@ mod tests {
             out.lines().any(|l| l.starts_with("  export")),
             "body not indented: {}",
             out
-        );
-    }
-
-    #[test]
-    fn cond_not() {
-        let e = bash();
-        assert_eq!(
-            e.cond(&Cond::Not(Box::new(Cond::Have("git".into())))),
-            "! command -v git >/dev/null 2>&1"
-        );
-    }
-
-    #[test]
-    fn cond_and() {
-        let e = bash();
-        assert_eq!(
-            e.cond(&Cond::And(
-                Box::new(Cond::Have("cargo".into())),
-                Box::new(Cond::Os("linux".into())),
-            )),
-            "command -v cargo >/dev/null 2>&1 && [ \"$(uname -s)\" = \"Linux\" ]"
-        );
-    }
-
-    #[test]
-    fn cond_or() {
-        let e = bash();
-        assert_eq!(
-            e.cond(&Cond::Or(
-                Box::new(Cond::Os("darwin".into())),
-                Box::new(Cond::Os("linux".into())),
-            )),
-            "[ \"$(uname -s)\" = \"Darwin\" ] || [ \"$(uname -s)\" = \"Linux\" ]"
         );
     }
 }

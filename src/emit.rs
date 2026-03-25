@@ -35,9 +35,6 @@ pub trait Emitter {
     fn emit_nodes(&self, nodes: &[Node], depth: usize) -> Vec<String>;
 
     /// Render the full node list to a newline-joined `String`.
-    ///
-    /// Pre-allocates a reasonable output buffer; the `join` still allocates once
-    /// but avoids repeated `push_str` reallocations.
     fn render(&self, nodes: &[Node]) -> String {
         self.emit_nodes(nodes, 0).join("\n")
     }
@@ -47,6 +44,23 @@ pub trait Emitter {
     #[inline]
     fn resolve_call_args(&self, args: &str) -> String {
         args.replace("{shell}", self.name()).trim().to_owned()
+    }
+
+    /// Format a `call` node using shell-specific prefix and suffix strings.
+    ///
+    /// `prefix` wraps the command+args (e.g. `"eval \"$("` for bash).
+    /// `suffix` closes it (e.g. `")\""` for bash, `" | source"` for fish).
+    ///
+    /// When `args` is empty the space between cmd and args is omitted.
+    /// The result is a single output line, not yet indented.
+    #[inline]
+    fn format_call(&self, cmd: &str, args: &str, prefix: &str, suffix: &str) -> String {
+        let a = self.resolve_call_args(args);
+        if a.is_empty() {
+            format!("{}{}{}", prefix, cmd, suffix)
+        } else {
+            format!("{}{} {}{}", prefix, cmd, a, suffix)
+        }
     }
 
     /// Return `s` prefixed by `depth * 2` spaces (delegates to the free function).

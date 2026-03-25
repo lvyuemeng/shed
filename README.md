@@ -2,7 +2,7 @@
 
 **Sh**ell **E**nvironment **D**eclaration.
 
-Write your environment once. Compile to bash, zsh, fish, or powershell.
+Write your environment once. Compile to bash, zsh, fish, or PowerShell.
 
 ```sh
 shed bash  ~/.config/shed/env.shed   # → bash / POSIX sh
@@ -53,7 +53,7 @@ shed pwsh ~/.config/shed/env.shed | Invoke-Expression
 | `set` | `set KEY value` | Export an environment variable |
 | `path+` | `path+ dir` | Prepend `dir` to `PATH` (dedup-guarded) |
 | `path-` | `path- dir` | Append `dir` to `PATH` (dedup-guarded) |
-| `call` | `call cmd [args…]` | Run `cmd --init {shell}` style initialisers; `{shell}` expands to the target shell name |
+| `call` | `call cmd [args…]` | Run eval-init style initialisers; `{shell}` expands to the target shell name |
 | `alias` | `alias name body` | Define a shell alias |
 
 ### conditions
@@ -143,10 +143,11 @@ elif os linux
   set BROWSER xdg-open
 end
 
-# cargo bootstrap — chicken-and-egg free:
-# exists checks the directory at shell startup, before cargo is on PATH
+# cargo bootstrap
 if exists $HOME/.cargo/bin
   path+ $HOME/.cargo/bin
+  set CARGO_HOME $HOME/.cargo
+  set RUSTUP_HOME $HOME/.rustup
 end
 
 # alternative: check for the env var set by rustup
@@ -162,6 +163,7 @@ end
 # starship for every shell
 if have starship
   call starship init {shell}
+  set STARSHIP_CONFIG ~/.config/starship.toml
 end
 ```
 
@@ -179,6 +181,8 @@ elif [ "$(uname -s)" = "Linux" ]; then
 fi
 if [ -e "$HOME/.cargo/bin" ]; then
   [[ "${PATH}" != *"$HOME/.cargo/bin"* ]] && export PATH="$HOME/.cargo/bin:$PATH"
+  export CARGO_HOME="$HOME/.cargo"
+  export RUSTUP_HOME="$HOME/.rustup"
 fi
 if [ -n "${CARGO_HOME:-}" ]; then
   [[ "${PATH}" != *"$CARGO_HOME/bin"* ]] && export PATH="$CARGO_HOME/bin:$PATH"
@@ -188,6 +192,7 @@ if command -v zoxide >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
 fi
 if command -v starship >/dev/null 2>&1; then
   eval "$(starship init bash)"
+  export STARSHIP_CONFIG="~/.config/starship.toml"
 fi
 ```
 
@@ -207,6 +212,8 @@ else if test (uname -s) = "Linux"
 end
 if test -e "$HOME/.cargo/bin"
   fish_add_path -gP "$HOME/.cargo/bin"
+  set -gx CARGO_HOME "$HOME/.cargo"
+  set -gx RUSTUP_HOME "$HOME/.rustup"
 end
 if set -q CARGO_HOME
   fish_add_path -gP "$CARGO_HOME/bin"
@@ -216,6 +223,7 @@ if type -q zoxide;  and test (uname -s) = "Linux"
 end
 if type -q starship
   starship init fish | source
+  set -gx STARSHIP_CONFIG "~/.config/starship.toml"
 end
 ```
 
@@ -226,8 +234,8 @@ end
 
 ```powershell
 $env:EDITOR = "nvim"
-Set-Alias ll ls -la
-Set-Alias g git
+Set-Alias -Scope Global -Name ll -Value ls -la
+Set-Alias -Scope Global -Name g -Value git
 if ($IsMacOS) {
   $env:BROWSER = "open"
 } elseif ($IsLinux) {
@@ -235,6 +243,8 @@ if ($IsMacOS) {
 }
 if (Test-Path "$HOME/.cargo/bin") {
   if ($env:PATH -notlike '*$HOME/.cargo/bin*') { $env:PATH = "$HOME/.cargo/bin;$env:PATH" }
+  $env:CARGO_HOME = "$HOME/.cargo"
+  $env:RUSTUP_HOME = "$HOME/.rustup"
 }
 if ((Test-Path env:CARGO_HOME)) {
   if ($env:PATH -notlike '*$CARGO_HOME/bin*') { $env:PATH = "$CARGO_HOME/bin;$env:PATH" }
@@ -244,6 +254,7 @@ if ((Get-Command zoxide -ErrorAction SilentlyContinue) -and ($IsLinux)) {
 }
 if (Get-Command starship -ErrorAction SilentlyContinue) {
   Invoke-Expression (& starship init powershell)
+  $env:STARSHIP_CONFIG = "~/.config/starship.toml"
 }
 ```
 
@@ -251,23 +262,44 @@ if (Get-Command starship -ErrorAction SilentlyContinue) {
 
 ## path resolution
 
-`path+` and `path-` directories are resolved during parsing, applied in order:
+Paths in `path+`, `path-`, and `exists` are processed at parse time:
 
-1. **`~` prefix** — expanded to `$HOME` (Unix) or `%USERPROFILE%` (Windows).
-   If neither variable is set the `~` is kept as-is.
+1. **Shell variables** — tokens containing `$` (e.g. `$HOME`, `$env:USERPROFILE`,
+   `$CARGO_HOME`) and the tilde shorthand `~` are **left as-is**. The target shell
+   expands them at runtime. `~` is not expanded inside double-quoted strings by
+   any shell, so shed never embeds it in a quoted context.
 2. **Relative path** — joined onto the directory that contains the `.shed` file,
    so the file is portable regardless of where you run `shed` from.
    When reading from stdin there is no anchor; relative paths are emitted unchanged.
 3. **Absolute path** — passed through unchanged.
+4. **Delimiter normalisation** — backslashes (`\`) are always converted to forward
+   slashes (`/`). PowerShell Core, bash, zsh, and fish all accept `/` as the
+   path separator.
 
-No filesystem access is performed; the path does not need to exist.
+No filesystem access is performed; the path does not need to exist at compile time.
 
 ```sh
-# given: shed bash ~/dot/env.shed
-path+ ~/.cargo/bin      # → $HOME/.cargo/bin          (rule 1)
-path+ bin               # → /home/you/dot/bin          (rule 2, relative to env.shed)
-path+ /usr/local/bin    # → /usr/local/bin             (rule 3, absolute)
+# All of the following are valid and passed through correctly:
+path+ $HOME/.cargo/bin        # → $HOME/.cargo/bin   (shell expands at runtime)
+path+ ~/.local/bin            # → ~/.local/bin        (shell expands at runtime)
+path+ $env:USERPROFILE/tools  # → $env:USERPROFILE/tools  (pwsh expands at runtime)
+path+ bin                     # → /home/you/dot/bin   (relative → joined to shed file dir)
+path+ /usr/local/bin          # → /usr/local/bin      (absolute, unchanged)
 ```
+
+### aliases
+
+Aliases are emitted with shell-correct syntax:
+
+| Shell | Output |
+|-------|--------|
+| bash/zsh | `alias name='body'` |
+| fish | `alias name body` |
+| pwsh | `Set-Alias -Scope Global -Name name -Value body` |
+
+PowerShell requires `-Scope Global` so the alias survives past the dot-sourced
+script frame into the interactive session. `-Name` and `-Value` are always
+explicit to avoid positional ambiguity with multi-word bodies.
 
 ## chezmoi
 
@@ -298,29 +330,6 @@ No templates needed. No loaders. No per-shell files.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and
 [`docs/AGENT.md`](docs/AGENT.md) for coding conventions.
-
-## benchmarking
-
-shed processes source text in a single linear pass with no heavy IR. For
-typical configs (< 100 lines) performance is dominated by process startup.
-To measure regressions on larger inputs:
-
-```sh
-# Flamegraph (Linux perf)
-cargo install flamegraph
-cargo flamegraph --bin shed -- bash large.shed > /dev/null
-
-# perf stat — wall time + instruction count
-perf stat -r 50 ./target/release/shed bash large.shed > /dev/null
-
-# criterion micro-benchmarks (add benches/shed.rs)
-cargo add --dev criterion
-cargo bench
-```
-
-Key metrics to track: **wall time**, **peak RSS**, **heap allocations**
-(use [`dhat`](https://docs.rs/dhat) with `#[global_allocator]` to count
-allocations without a profiler).
 
 ## license
 

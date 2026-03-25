@@ -30,18 +30,13 @@ impl FishEmitter {
             Node::Path { dir, direction } => {
                 let flag = match direction {
                     PathDir::Prepend => "-gP",
-                    PathDir::Append  => "-gaP",
+                    PathDir::Append => "-gaP",
                 };
                 out.push(self.indent(format!("fish_add_path {} \"{}\"", flag, dir), d));
             }
 
             Node::Call { cmd, args } => {
-                let a = self.resolve_call_args(args);
-                let s = if a.is_empty() {
-                    format!("{} | source", cmd)
-                } else {
-                    format!("{} {} | source", cmd, a)
-                };
+                let s = self.format_call(cmd, args, "", " | source");
                 out.push(self.indent(s, d));
             }
 
@@ -55,12 +50,16 @@ impl FishEmitter {
 
     fn cond(&self, c: &Cond) -> String {
         match c {
-            Cond::Have(cmd)    => format!("type -q {}", cmd),
+            Cond::Have(cmd) => format!("type -q {}", cmd),
             Cond::Exists(path) => format!("test -e \"{}\"", path),
-            Cond::Env(var)     => format!("set -q {}", var),
-            Cond::Os(name)     => format!("test (uname -s) = \"{}\"", os_uname_name(name)),
-            Cond::Shell(name)  => {
-                if name == "fish" { "true".into() } else { "false".into() }
+            Cond::Env(var) => format!("set -q {}", var),
+            Cond::Os(name) => format!("test (uname -s) = \"{}\"", os_uname_name(name)),
+            Cond::Shell(name) => {
+                if name == "fish" {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
             }
             Cond::Not(inner) => {
                 let mut s = String::from("not ");
@@ -122,50 +121,81 @@ mod tests {
         FishEmitter.render(nodes)
     }
 
+    // ── Node::Set ─────────────────────────────────────────────────────────────
+
     #[test]
     fn set() {
-        let out = render(&[Node::Set {
-            key: "EDITOR".into(),
-            val: "nvim".into(),
-        }]);
-        assert_eq!(out, "set -gx EDITOR \"nvim\"");
+        assert_eq!(
+            render(&[Node::Set {
+                key: "EDITOR".into(),
+                val: "nvim".into()
+            }]),
+            "set -gx EDITOR \"nvim\""
+        );
     }
+
+    // ── Node::Path ────────────────────────────────────────────────────────────
 
     #[test]
     fn path_prepend() {
-        let out = render(&[Node::Path {
-            dir: "/usr/local/bin".into(),
-            direction: PathDir::Prepend,
-        }]);
-        assert_eq!(out, "fish_add_path -gP \"/usr/local/bin\"");
+        assert_eq!(
+            render(&[Node::Path {
+                dir: "/usr/local/bin".into(),
+                direction: PathDir::Prepend
+            }]),
+            "fish_add_path -gP \"/usr/local/bin\""
+        );
     }
 
     #[test]
     fn path_append() {
-        let out = render(&[Node::Path {
-            dir: "/opt/bin".into(),
-            direction: PathDir::Append,
-        }]);
-        assert_eq!(out, "fish_add_path -gaP \"/opt/bin\"");
+        assert_eq!(
+            render(&[Node::Path {
+                dir: "/opt/bin".into(),
+                direction: PathDir::Append
+            }]),
+            "fish_add_path -gaP \"/opt/bin\""
+        );
     }
+
+    // ── Node::Call ────────────────────────────────────────────────────────────
 
     #[test]
     fn call_with_shell_placeholder() {
-        let out = render(&[Node::Call {
-            cmd: "starship".into(),
-            args: "init {shell}".into(),
-        }]);
-        assert_eq!(out, "starship init fish | source");
+        assert_eq!(
+            render(&[Node::Call {
+                cmd: "starship".into(),
+                args: "init {shell}".into()
+            }]),
+            "starship init fish | source"
+        );
     }
 
     #[test]
     fn call_no_args() {
-        let out = render(&[Node::Call {
-            cmd: "myprog".into(),
-            args: String::new(),
-        }]);
-        assert_eq!(out, "myprog | source");
+        assert_eq!(
+            render(&[Node::Call {
+                cmd: "myprog".into(),
+                args: String::new()
+            }]),
+            "myprog | source"
+        );
     }
+
+    // ── Node::Alias ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn alias_bare() {
+        assert_eq!(
+            render(&[Node::Alias {
+                name: "ll".into(),
+                body: "ls -la".into()
+            }]),
+            "alias ll ls -la"
+        );
+    }
+
+    // ── conditions ────────────────────────────────────────────────────────────
 
     #[test]
     fn cond_have() {
@@ -213,6 +243,38 @@ mod tests {
     fn cond_shell_other_is_false() {
         assert_eq!(FishEmitter.cond(&Cond::Shell("bash".into())), "false");
     }
+
+    #[test]
+    fn cond_not() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::Not(Box::new(Cond::Have("git".into())))),
+            "not type -q git"
+        );
+    }
+
+    #[test]
+    fn cond_and() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::And(
+                Box::new(Cond::Have("cargo".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "type -q cargo;  and test (uname -s) = \"Linux\""
+        );
+    }
+
+    #[test]
+    fn cond_or() {
+        assert_eq!(
+            FishEmitter.cond(&Cond::Or(
+                Box::new(Cond::Os("darwin".into())),
+                Box::new(Cond::Os("linux".into())),
+            )),
+            "test (uname -s) = \"Darwin\";  or test (uname -s) = \"Linux\""
+        );
+    }
+
+    // ── if / elif / else / end ────────────────────────────────────────────────
 
     #[test]
     fn if_end() {
@@ -273,36 +335,6 @@ mod tests {
             out.lines().any(|l| l.starts_with("  set -gx")),
             "body not indented: {}",
             out
-        );
-    }
-
-    #[test]
-    fn cond_not() {
-        assert_eq!(
-            FishEmitter.cond(&Cond::Not(Box::new(Cond::Have("git".into())))),
-            "not type -q git"
-        );
-    }
-
-    #[test]
-    fn cond_and() {
-        assert_eq!(
-            FishEmitter.cond(&Cond::And(
-                Box::new(Cond::Have("cargo".into())),
-                Box::new(Cond::Os("linux".into())),
-            )),
-            "type -q cargo;  and test (uname -s) = \"Linux\""
-        );
-    }
-
-    #[test]
-    fn cond_or() {
-        assert_eq!(
-            FishEmitter.cond(&Cond::Or(
-                Box::new(Cond::Os("darwin".into())),
-                Box::new(Cond::Os("linux".into())),
-            )),
-            "test (uname -s) = \"Darwin\";  or test (uname -s) = \"Linux\""
         );
     }
 }
