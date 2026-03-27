@@ -479,51 +479,97 @@ The emitters wrap every `Path` node with an existence-then-duplicate guard:
 
 ## Quote Stripping in the Parser
 
-When a user writes `path+ "$HOME/.cargo/bin"` the surrounding double-quotes
-become part of the stored token and are then emitted again, producing
-`"\"$HOME/.cargo/bin\""` (double-quoted). The parser strips a single layer of
-surrounding `"…"` or `'…'` from any single-token value.
+**Implemented.** `strip_quotes(s)` strips a single layer of surrounding
+`"…"` or `'…'` from any wholly-wrapped token. Partial quotes and multi-token
+values are left alone. Applied via `tail_stripped` / `tok_stripped` helpers
+to every value position (`val`, `dir`, `cmd`, `body`, condition value).
 
-Rule: strip quotes only when the entire token is wrapped (`"foo"` → `foo`,
-`'bar'` → `bar`); leave partial quotes and multi-token values alone.
+Rule: `"foo"` → `foo`, `'bar'` → `bar`, `foo"bar` → `foo"bar` (unchanged).
 
-Change surface: one private helper [`strip_quotes(s)`](src/parser.rs) called
-on every value token (`val`, `dir`, `cmd`, `body`, condition value).
+---
+
+## Shell Variable Injection Guard
+
+**Implemented.** `contains_shell_variable(s)` returns `true` when a path
+token starts with `~` or contains `$`. Such tokens are returned from
+`resolve_path` as-is (only `\` → `/` normalisation applied).
+
+This prevents `$HOME/go/bin` from being passed through `PathBuf` and
+corrupted into `C:\Users\user\$HOME/go/bin` on Windows.
+
+Rule:
+- `$HOME/.cargo/bin` → stored as `$HOME/.cargo/bin` (target shell expands)
+- `~/bin` → stored as `~/bin` (target shell expands)
+- `$env:USERPROFILE/.cargo` → stored unchanged
+- `C:\tools` → normalised to `C:/tools`
+
+Applied in `parse_statement` for `path+`/`path-` and in `parse_leaf` for
+`exists` conditions.
+
+---
+
+## `alias` Keyword
+
+**Implemented.** `Node::Alias { name, body }` is in `ast.rs`. All four
+emitters render it with shell-correct syntax:
+
+| Shell | Output |
+|-------|--------|
+| bash/zsh | `alias name='body'` |
+| fish | `alias name body` |
+| pwsh | `Set-Alias -Scope Global -Name name -Value body` |
+
+PowerShell requires `-Scope Global` so the alias survives past the
+dot-sourced script frame. `-Name` / `-Value` are always explicit to avoid
+positional ambiguity with multi-word bodies.
+
+---
+
+## `format_call` on the Emitter Trait
+
+**Implemented.** The `Emitter` trait provides a default `format_call` method:
+
+```rust
+fn format_call(&self, cmd: &str, args: &str, prefix: &str, suffix: &str) -> String
+```
+
+It calls `resolve_call_args` for `{shell}` substitution then builds
+`prefix + cmd [+ " " + args] + suffix`. All three backends use it, removing
+the repeated `if a.is_empty()` branch that previously existed in each emitter.
+
+`PwshEmitter` overrides `resolve_call_args` to substitute `"powershell"` for
+`{shell}` (the correct init-command name) while keeping `name()` returning
+`"pwsh"` (the DSL identifier used in routing and `Cond::Shell` comparisons).
+
+---
+
+## Structured Error Type
+
+**Implemented.** `ParseError { line: usize, msg: String }` is defined in
+`src/ast.rs`. All parser errors carry the 1-based source line number.
+Error messages are plain English, lowercase, no trailing period.
+
+```
+shed: line 42: unknown keyword "sett"
+shed: line 7: usage: set KEY VALUE
+```
 
 ---
 
 ## Proposed Improvement Plan
 
-Ordered highest to lowest impact. All items are evolutionary; none requires
-changing the three-stage architecture.
+Items below are not yet implemented.
 
 ---
 
-### P1 -- Line-number tracking in error messages
-
-Problem.
-  Errors say what went wrong but not where. A 100-line env.shed cannot be
-  searched without counting lines manually.
-
-Approach.
-  Retain the original 1-based line number alongside each token-line during
-  pre-tokenisation, as (usize, Vec). Thread it into every error
-  string from block(), parse_cond(), and parse_if().
-
-Change surface.  parser.rs only. The AST and all emitters are unaffected.
-
-Result.  shed: line 42: unknown keyword "sett"
-
----
-
-### P2 -- Variable interpolation in values
+### P1 -- Variable interpolation in values
 
 Problem.
   `set FOO $HOME/tool` emits the literal string $HOME/tool. Bash expands it
   at eval time; fish and pwsh do not. Behaviour is silent and shell-dependent.
 
 Approach.
-  Represent a value as Vec where ValuePart is Literal(String) or
+  Represent a value as Vec<ValuePart> where ValuePart is Literal(String) or
   Var(String). Parser splits $VAR tokens in value positions. Each emitter
   renders Var(HOME) as $HOME (bash/zsh/fish) or $env:HOME (pwsh).
 
@@ -531,39 +577,7 @@ Change surface.  ast.rs (new ValuePart type), parser.rs, all four emitters.
 
 ---
 
-### P3 -- alias keyword
-
-Problem.
-  Shell aliases are the second most common env-file entry after exports.
-  Users currently need call or separate per-shell files.
-
-Approach.
-  Add Node::Alias { name: String, body: String }. Emitters render:
-    bash / zsh   alias name='body'
-    fish         alias name body
-    pwsh         Set-Alias name body
-
-Change surface.  ast.rs, parser.rs, all four emitters. Follows the existing
-                 extension pattern exactly.
-
----
-
-### P4 -- Structured error type
-
-Problem.
-  All errors are String. Testing requires fragile string matching.
-  A future library surface cannot expose typed errors to callers.
-
-Approach.
-  Hand-write a minimal Error enum (no external crates) with variants such as
-  UnknownKeyword, UnterminatedBlock, BadUsage. Implement std::fmt::Display.
-  Change Result to Result in the parser.
-
-Change surface.  New src/error.rs; parser.rs; main.rs. Emitters unaffected.
-
----
-
-### P5 -- zsh as a first-class backend
+### P2 -- zsh as a first-class backend
 
 Problem.
   zsh is emitted by BashEmitter with shell_name set to "zsh". This works via
@@ -577,3 +591,20 @@ Approach.
 
 Change surface.  src/emit/bash.rs (refactor), optional new src/emit/zsh.rs,
                  src/emit.rs, src/main.rs (match arm already present).
+
+---
+
+### P3 -- Multi-line string values
+
+Problem.
+  A value like `set FZF_OPTS "--preview 'echo {}'\n  --bind 'ctrl-y:...'"`
+  spanning multiple source lines is not representable. The parser is
+  line-oriented; continuation lines are seen as new statements.
+
+Approach.
+  Support a trailing `\` line-continuation in the pre-tokenisation step of
+  `Parser::new`. Lines ending with `\` are joined with the following line
+  before splitting into tokens. No AST change required.
+
+Change surface.  `Parser::new` in `src/parser.rs` only. The AST and all
+                 emitters are unaffected.
